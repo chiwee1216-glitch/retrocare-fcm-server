@@ -66,20 +66,30 @@ async function sendMedicineNotification({
     medicineTime || ""
   }，請記得服藥`;
 
-  const message = {
+const message = {
+  notification: {
+    title,
+    body,
+  },
+  android: {
+    priority: "high",
     notification: {
-      title,
-      body,
+      channelId: "medicine_fcm_channel_v1",
+      sound: "default",
+      defaultSound: true,
+      defaultVibrateTimings: true,
+      visibility: "public",
+      notificationPriority: "PRIORITY_MAX",
     },
-    data: {
-      type: "medicine_reminder",
-      patientId: patientId,
-      medicineName: medicineName || "",
-      medicineTime: medicineTime || "",
-    },
-    tokens: allTokens,
-  };
-
+  },
+  data: {
+    type: "medicine_reminder",
+    patientId: patientId,
+    medicineName: medicineName || "",
+    medicineTime: medicineTime || "",
+  },
+  tokens: allTokens,
+};
   const response = await admin.messaging().sendEachForMulticast(message);
 
   return {
