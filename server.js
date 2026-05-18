@@ -67,26 +67,16 @@ async function sendMedicineNotification({
   }，請記得服藥`;
 
 const message = {
-  notification: {
-    title,
-    body,
-  },
-  android: {
-    priority: "high",
-    notification: {
-      channelId: "medicine_fcm_channel_v5",
-      sound: "default",
-      defaultSound: true,
-      defaultVibrateTimings: true,
-      visibility: "public",
-      notificationPriority: "PRIORITY_MAX",
-    },
-  },
   data: {
     type: "medicine_reminder",
+    title: title,
+    body: body,
     patientId: patientId,
     medicineName: medicineName || "",
     medicineTime: medicineTime || "",
+  },
+  android: {
+    priority: "high",
   },
   tokens: allTokens,
 };
