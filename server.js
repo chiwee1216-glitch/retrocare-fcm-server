@@ -74,7 +74,7 @@ const message = {
   android: {
     priority: "high",
     notification: {
-      channelId: "medicine_fcm_channel_v4",
+      channelId: "medicine_fcm_channel_v5",
       sound: "default",
       defaultSound: true,
       defaultVibrateTimings: true,
