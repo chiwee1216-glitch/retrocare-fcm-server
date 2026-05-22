@@ -120,6 +120,74 @@ app.post("/send-medicine-notification", async (req, res) => {
   }
 });
 
+app.post("/send-help-request-notification", async (req, res) => {
+  try {
+    const {
+      requestId,
+      patientId,
+      patientName,
+      caregiverId
+    } = req.body;
+
+    if (!caregiverId) {
+      return res.status(400).json({
+        error: "caregiverId required"
+      });
+    }
+
+    const caregiverDoc = await db
+      .collection("users")
+      .doc(caregiverId)
+      .get();
+
+    if (!caregiverDoc.exists) {
+      return res.status(404).json({
+        error: "caregiver not found"
+      });
+    }
+
+    const caregiverData = caregiverDoc.data();
+    const tokens = caregiverData.fcmTokens || [];
+
+    if (!tokens.length) {
+      return res.status(404).json({
+        error: "no caregiver fcm tokens"
+      });
+    }
+
+    const message = {
+      tokens,
+      data: {
+        type: "help_request",
+        title: "病患求助通知",
+        body: `${patientName || "病患"} 需要協助，請立即確認狀況`,
+        requestId: requestId || "",
+        patientId: patientId || "",
+        patientName: patientName || ""
+      },
+      android: {
+        priority: "high"
+      }
+    };
+
+    const result = await admin
+      .messaging()
+      .sendEachForMulticast(message);
+
+    return res.json({
+      ok: true,
+      successCount: result.successCount,
+      failureCount: result.failureCount
+    });
+  } catch (error) {
+    console.error("send help request notification error:", error);
+
+    return res.status(500).json({
+      error: error.message
+    });
+  }
+});
+
 // 台灣日期 yyyy/MM/dd
 function getTodayTaipeiDateText() {
   const now = new Date();
