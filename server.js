@@ -152,6 +152,7 @@ async function sendMedicineNotification({
   medicineTime,
   doseIndex,
   totalDoses,
+  reminderKey,
 }) {
   if (!patientId) {
     throw new Error("缺少 patientId");
@@ -201,6 +202,7 @@ const message = {
     patientId: patientId,
     medicineName: medicineName || "",
     medicineTime: medicineTime || "",
+    reminderKey: reminderKey || "",
   },
   android: {
     priority: "high",
@@ -226,6 +228,7 @@ app.post("/send-medicine-notification", async (req, res) => {
       medicineTime,
       doseIndex,
       totalDoses,
+      reminderKey,
     } = req.body;
 
     const result = await sendMedicineNotification({
@@ -235,11 +238,84 @@ app.post("/send-medicine-notification", async (req, res) => {
       medicineTime,
       doseIndex,
       totalDoses,
+      reminderKey,
     });
 
     return res.json(result);
   } catch (error) {
     console.error("推播失敗：", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+app.post("/send-medicine-created-notification", async (req, res) => {
+  try {
+    const {
+      patientId,
+      medicineName,
+      medicineDate,
+      medicineTimes,
+      medicineIds,
+    } = req.body || {};
+
+    if (!patientId) {
+      return res.status(400).json({
+        success: false,
+        message: "patientId required",
+      });
+    }
+
+    const patientDoc = await db.collection("users").doc(patientId).get();
+
+    if (!patientDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: "patient not found",
+      });
+    }
+
+    const tokens = patientDoc.data().fcmTokens || [];
+    const times = Array.isArray(medicineTimes) ? medicineTimes : [];
+    const ids = Array.isArray(medicineIds) ? medicineIds : [];
+
+    if (!tokens.length) {
+      return res.json({
+        success: false,
+        message: "no patient fcm tokens",
+        successCount: 0,
+        failureCount: 0,
+      });
+    }
+
+    const title = `已新增服藥提醒：${medicineName || "藥物"}`;
+    const body = `${medicineDate || ""}，時間 ${times.join("、")}`;
+    const result = await admin.messaging().sendEachForMulticast({
+      tokens,
+      data: {
+        type: "medicine_created",
+        title,
+        body,
+        patientId,
+        medicineName: medicineName || "",
+        medicineDate: medicineDate || "",
+        medicineTimes: JSON.stringify(times),
+        medicineIds: JSON.stringify(ids),
+      },
+      android: {
+        priority: "high",
+      },
+    });
+
+    return res.json({
+      success: true,
+      successCount: result.successCount,
+      failureCount: result.failureCount,
+    });
+  } catch (error) {
+    console.error("send medicine created notification error:", error);
     return res.status(500).json({
       success: false,
       message: error.message,
@@ -341,11 +417,21 @@ function getNowTaipeiTimeText() {
   });
 }
 
-// 新增：檢查服藥時間，到時間就推播
-app.get("/check-medicine-reminders", async (req, res) => {
-  try {
+function timeTextToMinutes(value) {
+  const parts = String(value || "").split(":");
+  if (parts.length !== 2) return null;
+
+  const hour = Number(parts[0]);
+  const minute = Number(parts[1]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return null;
+
+  return hour * 60 + minute;
+}
+
+async function checkMedicineReminders() {
     const today = getTodayTaipeiDateText();
     const nowTime = getNowTaipeiTimeText();
+    const nowMinutes = timeTextToMinutes(nowTime);
 
     console.log(`開始檢查服藥提醒：date=${today}, time=${nowTime}`);
 
@@ -373,20 +459,35 @@ app.get("/check-medicine-reminders", async (req, res) => {
       const doseIndex = data.doseIndex || 1;
       const totalDoses = parseInt(data.times || "1", 10) || 1;
       const reminderSent = data.reminderSent === true;
+      const medicineMinutes = timeTextToMinutes(medicineTime);
 
-      if (!patientId || !medicineTime) {
+      if (!patientId || medicineMinutes === null || nowMinutes === null) {
         skippedCount++;
         continue;
       }
 
       // 還沒到時間
-      if (medicineTime > nowTime) {
+      if (medicineMinutes > nowMinutes) {
         skippedCount++;
         continue;
       }
 
       // 已經發過，避免重複推播
       if (reminderSent) {
+        skippedCount++;
+        continue;
+      }
+
+      // 避免伺服器重新部署時一次補送很久以前的舊提醒。
+      if (nowMinutes - medicineMinutes > 10) {
+        await doc.ref.set(
+          {
+            reminderExpired: true,
+            reminderExpiredAt:
+              admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
         skippedCount++;
         continue;
       }
@@ -399,6 +500,7 @@ app.get("/check-medicine-reminders", async (req, res) => {
           medicineTime,
           doseIndex,
           totalDoses,
+          reminderKey: `${medicineId}_${today}_${medicineTime}`,
         });
         const medicineBoxResult = await queueMedicineBoxCommand(
           patientId,
@@ -433,7 +535,7 @@ app.get("/check-medicine-reminders", async (req, res) => {
       }
     }
 
-    return res.json({
+    return {
       success: true,
       today,
       nowTime,
@@ -441,10 +543,15 @@ app.get("/check-medicine-reminders", async (req, res) => {
       sentCount,
       skippedCount,
       failedCount,
-    });
+    };
+}
+
+// 檢查服藥時間，到時間就推播
+app.get("/check-medicine-reminders", async (req, res) => {
+  try {
+    return res.json(await checkMedicineReminders());
   } catch (error) {
     console.error("檢查服藥提醒失敗：", error);
-
     return res.status(500).json({
       success: false,
       message: error.message,
@@ -457,3 +564,21 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`RetroCare FCM Server running on port ${PORT}`);
 });
+
+let reminderCheckRunning = false;
+
+setInterval(async () => {
+  if (reminderCheckRunning) return;
+  reminderCheckRunning = true;
+
+  try {
+    const result = await checkMedicineReminders();
+    if (result.sentCount > 0 || result.failedCount > 0) {
+      console.log("定時服藥檢查結果：", result);
+    }
+  } catch (error) {
+    console.error("定時服藥檢查失敗：", error);
+  } finally {
+    reminderCheckRunning = false;
+  }
+}, 30000);
