@@ -88,13 +88,13 @@ app.get("/device/config", authenticateMedicineBox, async (req, res) => {
     }
 
     const data = deviceDoc.data() || {};
-    const command = data.buzzerCommand || {};
+    const command = data.deviceCommand || data.buzzerCommand || {};
 
     return res.json({
       success: true,
       buzzerEnabled: data.buzzerEnabled !== false,
-      buzzerCommandId: command.id || "",
-      buzzerAction: command.action || "",
+      deviceCommandId: command.id || "",
+      deviceAction: command.action || "",
     });
   } catch (error) {
     console.error("device config error:", error);
@@ -104,6 +104,46 @@ app.get("/device/config", authenticateMedicineBox, async (req, res) => {
     });
   }
 });
+
+async function queueMedicineBoxCommand(patientId, action) {
+  if (!patientId) {
+    return { queued: false, reason: "missing_patient_id" };
+  }
+
+  const snapshot = await db
+    .collection("devices")
+    .where("patientId", "==", patientId)
+    .limit(1)
+    .get();
+
+  if (snapshot.empty) {
+    return { queued: false, reason: "device_not_registered" };
+  }
+
+  const deviceDoc = snapshot.docs[0];
+  const deviceData = deviceDoc.data() || {};
+
+  if (
+    (action === "beep" || action === "help") &&
+    deviceData.buzzerEnabled === false
+  ) {
+    return { queued: false, reason: "buzzer_disabled" };
+  }
+
+  await deviceDoc.ref.set(
+    {
+      deviceCommand: {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        action,
+        issuedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  return { queued: true, deviceId: deviceDoc.id };
+}
 
 async function sendMedicineNotification({
   patientId,
@@ -360,12 +400,17 @@ app.get("/check-medicine-reminders", async (req, res) => {
           doseIndex,
           totalDoses,
         });
+        const medicineBoxResult = await queueMedicineBoxCommand(
+          patientId,
+          "beep"
+        );
 
         await db.collection("medicines").doc(medicineId).set(
           {
             reminderSent: true,
             reminderSentAt: admin.firestore.FieldValue.serverTimestamp(),
             reminderResult: result,
+            medicineBoxReminderResult: medicineBoxResult,
           },
           { merge: true }
         );
