@@ -18,6 +18,93 @@ app.get("/", (req, res) => {
   res.send("RetroCare FCM Server is running");
 });
 
+function authenticateMedicineBox(req, res, next) {
+  const configuredSecret = process.env.DEVICE_API_SECRET;
+  const deviceId = String(req.header("x-device-id") || "").trim();
+  const deviceSecret = String(req.header("x-device-secret") || "");
+
+  if (!configuredSecret) {
+    return res.status(503).json({
+      success: false,
+      message: "DEVICE_API_SECRET is not configured",
+    });
+  }
+
+  if (!deviceId || deviceSecret !== configuredSecret) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid medicine box credentials",
+    });
+  }
+
+  req.deviceId = deviceId;
+  next();
+}
+
+app.post("/device/report", authenticateMedicineBox, async (req, res) => {
+  try {
+    const deviceRef = db.collection("devices").doc(req.deviceId);
+    const deviceDoc = await deviceRef.get();
+
+    if (!deviceDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: "Register this device ID in the app first",
+      });
+    }
+
+    const body = req.body || {};
+
+    await deviceRef.set(
+      {
+        status: body.status || {},
+        localIp: body.localIp || "",
+        firmwareVersion: body.firmwareVersion || "",
+        lastCommandId: body.lastCommandId || "",
+        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("device report error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+app.get("/device/config", authenticateMedicineBox, async (req, res) => {
+  try {
+    const deviceDoc = await db.collection("devices").doc(req.deviceId).get();
+
+    if (!deviceDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        message: "Register this device ID in the app first",
+      });
+    }
+
+    const data = deviceDoc.data() || {};
+    const command = data.buzzerCommand || {};
+
+    return res.json({
+      success: true,
+      buzzerEnabled: data.buzzerEnabled !== false,
+      buzzerCommandId: command.id || "",
+      buzzerAction: command.action || "",
+    });
+  } catch (error) {
+    console.error("device config error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
 async function sendMedicineNotification({
   patientId,
   caregiverId,
