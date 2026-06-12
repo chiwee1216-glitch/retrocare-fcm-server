@@ -1,0 +1,95 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+
+const {
+  getReminderCycle,
+  shouldClaimCycle,
+} = require("../repeat_reminder");
+
+const scheduledAt = new Date("2026-06-12T06:00:00.000Z");
+
+test("uses fixed five-minute reminder cycles", () => {
+  assert.deepEqual(
+    getReminderCycle({
+      scheduledAt,
+      now: new Date("2026-06-12T06:00:00.000Z"),
+      isDone: false,
+    }),
+    { cycleKey: "initial", repeatCount: 0, dueAt: scheduledAt }
+  );
+  assert.equal(
+    getReminderCycle({
+      scheduledAt,
+      now: new Date("2026-06-12T06:04:59.000Z"),
+      isDone: false,
+    }).cycleKey,
+    "initial"
+  );
+  assert.equal(
+    getReminderCycle({
+      scheduledAt,
+      now: new Date("2026-06-12T06:05:00.000Z"),
+      isDone: false,
+    }).cycleKey,
+    "repeat-1"
+  );
+  assert.equal(
+    getReminderCycle({
+      scheduledAt,
+      now: new Date("2026-06-12T06:10:00.000Z"),
+      isDone: false,
+    }).cycleKey,
+    "repeat-2"
+  );
+});
+
+test("continues reminder cycles across midnight", () => {
+  const cycle = getReminderCycle({
+    scheduledAt: new Date("2026-06-12T15:58:00.000Z"),
+    now: new Date("2026-06-12T16:08:00.000Z"),
+    isDone: false,
+  });
+
+  assert.equal(cycle.cycleKey, "repeat-2");
+  assert.equal(cycle.repeatCount, 2);
+});
+
+test("does not produce cycles before schedule or after completion", () => {
+  assert.equal(
+    getReminderCycle({
+      scheduledAt,
+      now: new Date("2026-06-12T05:59:59.000Z"),
+      isDone: false,
+    }),
+    null
+  );
+  assert.equal(
+    getReminderCycle({ scheduledAt, now: scheduledAt, isDone: true }),
+    null
+  );
+});
+
+test("claims a new cycle or an unfinished current cycle only", () => {
+  assert.equal(shouldClaimCycle({}, "initial"), true);
+  assert.equal(
+    shouldClaimCycle(
+      { currentCycleKey: "initial", currentCycleCompleted: false },
+      "initial"
+    ),
+    true
+  );
+  assert.equal(
+    shouldClaimCycle(
+      { currentCycleKey: "initial", currentCycleCompleted: true },
+      "initial"
+    ),
+    false
+  );
+  assert.equal(
+    shouldClaimCycle(
+      { currentCycleKey: "initial", currentCycleCompleted: true },
+      "repeat-1"
+    ),
+    true
+  );
+});
