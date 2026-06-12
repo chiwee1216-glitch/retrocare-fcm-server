@@ -20,6 +20,16 @@ function buildReminderKey(medicineId, dateText, timeText) {
   ].join("_");
 }
 
+function deriveCronSecret(deviceSecret) {
+  const source = String(deviceSecret || "");
+  if (!source) return "";
+
+  return crypto
+    .createHash("sha256")
+    .update(`retrocare-cron:${source}`, "utf8")
+    .digest("hex");
+}
+
 function isCronAuthorized(providedSecret, configuredSecret) {
   const provided = Buffer.from(String(providedSecret || ""));
   const configured = Buffer.from(String(configuredSecret || ""));
@@ -67,6 +77,7 @@ function isExpired({ nowMinutes, medicineMinutes }) {
 
 module.exports = {
   buildReminderKey,
+  deriveCronSecret,
   isCronAuthorized,
   isDeliveryComplete,
   isExpired,

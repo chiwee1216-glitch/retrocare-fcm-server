@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const {
   buildReminderKey,
+  deriveCronSecret,
   isCronAuthorized,
   isDeliveryComplete,
   isExpired,
@@ -15,6 +16,15 @@ test("authorizes only an exact non-empty cron secret", () => {
   assert.equal(isCronAuthorized("same-secret", "same-secret"), true);
   assert.equal(isCronAuthorized("wrong", "same-secret"), false);
   assert.equal(isCronAuthorized("", ""), false);
+});
+
+test("derives a stable cron-only secret from the device secret", () => {
+  const derived = deriveCronSecret("device-secret");
+
+  assert.equal(derived.length, 64);
+  assert.equal(derived, deriveCronSecret("device-secret"));
+  assert.notEqual(derived, deriveCronSecret("other-device-secret"));
+  assert.equal(deriveCronSecret(""), "");
 });
 
 test("builds a Firestore-safe daily reminder key", () => {

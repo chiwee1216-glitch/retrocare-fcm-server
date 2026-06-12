@@ -1,6 +1,10 @@
 name = "retrocare-reminder-scheduler"
 main = "src/index.mjs"
 compatibility_date = "2026-06-12"
+workers_dev = false
+
+[vars]
+RENDER_BASE_URL = "https://retrocare-fcm-server.onrender.com"
 
 [triggers]
 crons = ["* * * * *"]

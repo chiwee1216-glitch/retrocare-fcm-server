@@ -8,6 +8,7 @@ const {
 const { planTokenOwnership } = require("./fcm_token_ownership");
 const {
   buildReminderKey,
+  deriveCronSecret,
   isCronAuthorized,
   isExpired,
 } = require("./reminder_delivery");
@@ -56,21 +57,22 @@ function authenticateMedicineBox(req, res, next) {
 }
 
 function authenticateCron(req, res, next) {
-  const configuredSecret = String(process.env.CRON_SECRET || "");
+  const configuredSecrets = [
+    String(process.env.CRON_SECRET || ""),
+    deriveCronSecret(process.env.DEVICE_API_SECRET),
+  ].filter(Boolean);
+  const providedSecret = String(req.header("x-cron-secret") || "");
 
-  if (!configuredSecret) {
+  if (configuredSecrets.length === 0) {
     return res.status(503).json({
       success: false,
-      message: "CRON_SECRET is not configured",
+      message: "Cron authentication is not configured",
     });
   }
 
-  if (
-    !isCronAuthorized(
-      String(req.header("x-cron-secret") || ""),
-      configuredSecret
-    )
-  ) {
+  if (!configuredSecrets.some((secret) =>
+    isCronAuthorized(providedSecret, secret)
+  )) {
     return res.status(401).json({
       success: false,
       message: "Invalid cron credentials",
