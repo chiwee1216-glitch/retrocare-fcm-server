@@ -32,8 +32,24 @@ function buildMedicineMessage({ type, tokens, title, body, data }) {
   };
 }
 
+function buildMedicineDataMessage({ type, tokens, title, body, data }) {
+  return {
+    tokens: [...new Set(tokens.filter(Boolean))],
+    data: {
+      type,
+      title,
+      body,
+      ...stringifyData(data),
+    },
+    android: {
+      priority: "high",
+      ttl: 60 * 1000,
+    },
+  };
+}
+
 function buildMedicineReminderMessage({ tokens, title, body, data }) {
-  return buildMedicineMessage({
+  return buildMedicineDataMessage({
     type: "medicine_reminder",
     tokens,
     title,
@@ -53,7 +69,7 @@ function buildMedicineCreatedMessage({ tokens, title, body, data }) {
 }
 
 function buildMedicineOverdueMessage({ tokens, title, body, data }) {
-  return buildMedicineMessage({
+  return buildMedicineDataMessage({
     type: "medicine_overdue_reminder",
     tokens,
     title,

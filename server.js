@@ -476,6 +476,9 @@ async function sendMedicineNotification({
   const buildMessage = isOverdue
     ? buildMedicineOverdueMessage
     : buildMedicineReminderMessage;
+  const cycleKey = repeatCount === 0
+    ? "initial"
+    : `repeat-${repeatCount}`;
   const message = buildMessage({
     tokens: allTokens,
     title,
@@ -485,6 +488,7 @@ async function sendMedicineNotification({
       medicineName: medicineName || "",
       medicineTime: medicineTime || "",
       reminderKey: reminderKey || "",
+      reminderCycleKey: `${reminderKey || ""}:${cycleKey}`,
       repeatCount,
     },
   });
