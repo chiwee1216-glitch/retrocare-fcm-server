@@ -1,6 +1,11 @@
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
+const {
+  buildMedicineReminderMessage,
+  buildMedicineCreatedMessage,
+} = require("./notification_payload");
+const { planTokenOwnership } = require("./fcm_token_ownership");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -10,6 +15,9 @@ admin.initializeApp({
 
 const db = admin.firestore();
 const app = express();
+let reminderCheckRunning = false;
+let lastReminderCheckAt = 0;
+const REMINDER_CHECK_MIN_INTERVAL_MS = 15000;
 
 app.use(cors());
 app.use(express.json());
@@ -41,6 +49,110 @@ function authenticateMedicineBox(req, res, next) {
   next();
 }
 
+async function authenticateFirebaseUser(req, res, next) {
+  try {
+    const authorization = String(req.header("authorization") || "");
+    const idToken = authorization.startsWith("Bearer ")
+      ? authorization.slice(7).trim()
+      : "";
+
+    if (!idToken) {
+      return res.status(401).json({
+        success: false,
+        message: "Missing Firebase ID token",
+      });
+    }
+
+    req.firebaseUser = await admin.auth().verifyIdToken(idToken);
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid Firebase ID token",
+    });
+  }
+}
+
+app.post("/register-fcm-token", authenticateFirebaseUser, async (req, res) => {
+  try {
+    const activeUserId = req.firebaseUser.uid;
+    const token = String(req.body?.token || "").trim();
+    const previousToken = String(req.body?.previousToken || "").trim();
+
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: "FCM token required",
+      });
+    }
+
+    const matchingSnapshot = await db
+      .collection("users")
+      .where("fcmTokens", "array-contains", token)
+      .get();
+    const previousSnapshot =
+      previousToken && previousToken !== token
+        ? await db
+            .collection("users")
+            .where("fcmTokens", "array-contains", previousToken)
+            .get()
+        : null;
+
+    const plan = planTokenOwnership({
+      activeUserId,
+      token,
+      previousToken,
+      matchingUserIds: matchingSnapshot.docs.map((doc) => doc.id),
+      previousTokenUserIds:
+        previousSnapshot?.docs.map((doc) => doc.id) || [],
+    });
+    const removalBatch = db.batch();
+    const removalsByUserId = new Map();
+
+    for (const userId of plan.removeFromUserIds) {
+      removalsByUserId.set(userId, new Set([token]));
+    }
+
+    for (const userId of plan.removePreviousFromUserIds) {
+      const tokens = removalsByUserId.get(userId) || new Set();
+      tokens.add(previousToken);
+      removalsByUserId.set(userId, tokens);
+    }
+
+    for (const [userId, tokens] of removalsByUserId) {
+      removalBatch.set(
+        db.collection("users").doc(userId),
+        {
+          fcmTokens: admin.firestore.FieldValue.arrayRemove(...tokens),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    await removalBatch.commit();
+    await db.collection("users").doc(plan.addToUserId).set(
+      {
+        fcmTokens: admin.firestore.FieldValue.arrayUnion(token),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return res.json({
+      success: true,
+      removedFromAccountCount: plan.removeFromUserIds.length,
+      removedPreviousTokenCount: plan.removePreviousFromUserIds.length,
+    });
+  } catch (error) {
+    console.error("register FCM token error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
 app.post("/device/report", authenticateMedicineBox, async (req, res) => {
   try {
     const deviceRef = db.collection("devices").doc(req.deviceId);
@@ -65,6 +177,8 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
       },
       { merge: true }
     );
+
+    triggerReminderCheck();
 
     return res.json({ success: true });
   } catch (error) {
@@ -194,21 +308,17 @@ async function sendMedicineNotification({
     medicineTime || ""
   }，請記得服藥`;
 
-const message = {
-  data: {
-    type: "medicine_reminder",
-    title: title,
-    body: body,
-    patientId: patientId,
-    medicineName: medicineName || "",
-    medicineTime: medicineTime || "",
-    reminderKey: reminderKey || "",
-  },
-  android: {
-    priority: "high",
-  },
-  tokens: allTokens,
-};
+  const message = buildMedicineReminderMessage({
+    tokens: allTokens,
+    title,
+    body,
+    data: {
+      patientId,
+      medicineName: medicineName || "",
+      medicineTime: medicineTime || "",
+      reminderKey: reminderKey || "",
+    },
+  });
   const response = await admin.messaging().sendEachForMulticast(message);
 
   return {
@@ -292,22 +402,20 @@ app.post("/send-medicine-created-notification", async (req, res) => {
 
     const title = `已新增服藥提醒：${medicineName || "藥物"}`;
     const body = `${medicineDate || ""}，時間 ${times.join("、")}`;
-    const result = await admin.messaging().sendEachForMulticast({
-      tokens,
-      data: {
-        type: "medicine_created",
+    const result = await admin.messaging().sendEachForMulticast(
+      buildMedicineCreatedMessage({
+        tokens,
         title,
         body,
+        data: {
         patientId,
         medicineName: medicineName || "",
         medicineDate: medicineDate || "",
         medicineTimes: JSON.stringify(times),
         medicineIds: JSON.stringify(ids),
       },
-      android: {
-        priority: "high",
-      },
-    });
+      })
+    );
 
     return res.json({
       success: true,
@@ -559,26 +667,44 @@ app.get("/check-medicine-reminders", async (req, res) => {
   }
 });
 
+function triggerReminderCheck({ force = false } = {}) {
+  const now = Date.now();
+
+  if (reminderCheckRunning) {
+    return false;
+  }
+
+  if (!force && now - lastReminderCheckAt < REMINDER_CHECK_MIN_INTERVAL_MS) {
+    return false;
+  }
+
+  lastReminderCheckAt = now;
+  reminderCheckRunning = true;
+
+  Promise.resolve()
+    .then(() => checkMedicineReminders())
+    .then((result) => {
+      if (result.sentCount > 0 || result.failedCount > 0) {
+        console.log("Medicine reminder check result:", result);
+      }
+    })
+    .catch((error) => {
+      console.error("Medicine reminder check failed:", error);
+    })
+    .finally(() => {
+      reminderCheckRunning = false;
+    });
+
+  return true;
+}
+
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
   console.log(`RetroCare FCM Server running on port ${PORT}`);
+  triggerReminderCheck({ force: true });
 });
 
-let reminderCheckRunning = false;
-
-setInterval(async () => {
-  if (reminderCheckRunning) return;
-  reminderCheckRunning = true;
-
-  try {
-    const result = await checkMedicineReminders();
-    if (result.sentCount > 0 || result.failedCount > 0) {
-      console.log("定時服藥檢查結果：", result);
-    }
-  } catch (error) {
-    console.error("定時服藥檢查失敗：", error);
-  } finally {
-    reminderCheckRunning = false;
-  }
+setInterval(() => {
+  triggerReminderCheck();
 }, 30000);
