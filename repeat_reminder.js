@@ -34,8 +34,39 @@ function shouldClaimCycle(delivery = {}, cycleKey) {
   );
 }
 
+function prepareCycleDelivery(delivery = {}, cycleKey) {
+  const isCurrentCycle = delivery.currentCycleKey === cycleKey;
+
+  return {
+    phoneNotificationSent:
+      isCurrentCycle && delivery.currentCyclePhoneSent === true,
+    medicineBoxCommandQueued:
+      isCurrentCycle && delivery.currentCycleMedicineBoxQueued === true,
+    medicineBoxRequired: delivery.medicineBoxRequired !== false,
+  };
+}
+
+function buildCycleDeliveryState({ cycle, result }) {
+  return {
+    reminderState: "pending",
+    currentCycleKey: cycle.cycleKey,
+    currentCycleCompleted: result.completed === true,
+    currentCyclePhoneSent: result.phoneNotificationSent === true,
+    currentCycleMedicineBoxQueued:
+      result.medicineBoxCommandQueued === true,
+    medicineBoxRequired: result.medicineBoxRequired !== false,
+    repeatCount: cycle.repeatCount,
+    nextRepeatAt: new Date(
+      cycle.dueAt.getTime() + REPEAT_INTERVAL_MS
+    ),
+    reminderLastError: (result.errors || []).join("; "),
+  };
+}
+
 module.exports = {
   REPEAT_INTERVAL_MS,
+  buildCycleDeliveryState,
   getReminderCycle,
+  prepareCycleDelivery,
   shouldClaimCycle,
 };

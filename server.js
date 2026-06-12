@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const {
+  buildMedicineOverdueMessage,
   buildMedicineReminderMessage,
   buildMedicineCreatedMessage,
 } = require("./notification_payload");
@@ -10,9 +11,14 @@ const {
   buildReminderKey,
   deriveCronSecret,
   isCronAuthorized,
-  isExpired,
 } = require("./reminder_delivery");
 const { processReminder } = require("./reminder_scheduler");
+const {
+  buildCycleDeliveryState,
+  getReminderCycle,
+  prepareCycleDelivery,
+  shouldClaimCycle,
+} = require("./repeat_reminder");
 const {
   findNewTakenSlots,
   selectMedicineForTakenEvent,
@@ -419,6 +425,7 @@ async function sendMedicineNotification({
   doseIndex,
   totalDoses,
   reminderKey,
+  repeatCount = 0,
 }) {
   if (!patientId) {
     throw new Error("缺少 patientId");
@@ -455,12 +462,20 @@ async function sendMedicineNotification({
     };
   }
 
-  const title = `服藥提醒：${medicineName || "藥物"}`;
-  const body = `第 ${doseIndex || 1} 次 / 共 ${totalDoses || 1} 次，時間 ${
-    medicineTime || ""
-  }，請記得服藥`;
-
-  const message = buildMedicineReminderMessage({
+  const isOverdue = repeatCount > 0;
+  const displayName = medicineName || "藥物";
+  const title = isOverdue
+    ? `未服藥提醒：${displayName}`
+    : `服藥提醒：${displayName}`;
+  const body = isOverdue
+    ? `已超過 ${medicineTime || "預定"} 服藥時間，請儘快服藥。`
+    : `第 ${doseIndex || 1} 次 / 共 ${totalDoses || 1} 次，時間 ${
+        medicineTime || ""
+      }，請記得服藥。`;
+  const buildMessage = isOverdue
+    ? buildMedicineOverdueMessage
+    : buildMedicineReminderMessage;
+  const message = buildMessage({
     tokens: allTokens,
     title,
     body,
@@ -469,6 +484,7 @@ async function sendMedicineNotification({
       medicineName: medicineName || "",
       medicineTime: medicineTime || "",
       reminderKey: reminderKey || "",
+      repeatCount,
     },
   });
   const response = await admin.messaging().sendEachForMulticast(message);
@@ -731,21 +747,30 @@ async function claimReminderDelivery({
   reminderKey,
   medicineId,
   patientId,
+  medicineRef,
+  cycle,
 }) {
   const deliveryRef = db.collection("reminderDeliveries").doc(reminderKey);
   const nowMillis = Date.now();
   const leaseUntilMillis = nowMillis + 2 * 60 * 1000;
 
   return db.runTransaction(async (transaction) => {
-    const snapshot = await transaction.get(deliveryRef);
+    const [snapshot, medicineSnapshot] = await Promise.all([
+      transaction.get(deliveryRef),
+      transaction.get(medicineRef),
+    ]);
     const delivery = snapshot.exists ? snapshot.data() || {} : {};
     const leaseUntil = delivery.reminderLeaseUntil?.toMillis?.() || 0;
 
     if (
-      delivery.reminderState === "completed" ||
-      delivery.reminderState === "expired"
+      !medicineSnapshot.exists ||
+      medicineSnapshot.data()?.isDone === true
     ) {
-      return { claimed: false, delivery, reason: delivery.reminderState };
+      return { claimed: false, delivery, reason: "medicine_completed" };
+    }
+
+    if (!shouldClaimCycle(delivery, cycle.cycleKey)) {
+      return { claimed: false, delivery, reason: "cycle_completed" };
     }
 
     if (
@@ -757,11 +782,22 @@ async function claimReminderDelivery({
 
     const reminderAttemptCount =
       Number(delivery.reminderAttemptCount || 0) + 1;
+    const isNewCycle = delivery.currentCycleKey !== cycle.cycleKey;
     const claimedDelivery = {
       ...delivery,
       reminderKey,
       medicineId,
       patientId,
+      currentCycleKey: cycle.cycleKey,
+      currentCycleCompleted: isNewCycle
+        ? false
+        : delivery.currentCycleCompleted === true,
+      currentCyclePhoneSent: isNewCycle
+        ? false
+        : delivery.currentCyclePhoneSent === true,
+      currentCycleMedicineBoxQueued: isNewCycle
+        ? false
+        : delivery.currentCycleMedicineBoxQueued === true,
       reminderState: "processing",
       reminderAttemptCount,
       reminderLeaseUntil:
@@ -774,6 +810,14 @@ async function claimReminderDelivery({
         reminderKey,
         medicineId,
         patientId,
+        currentCycleKey: cycle.cycleKey,
+        ...(isNewCycle
+          ? {
+              currentCycleCompleted: false,
+              currentCyclePhoneSent: false,
+              currentCycleMedicineBoxQueued: false,
+            }
+          : {}),
         reminderState: "processing",
         reminderAttemptCount,
         reminderLeaseUntil:
@@ -792,40 +836,12 @@ async function claimReminderDelivery({
   });
 }
 
-async function expireReminder({ doc, reminderKey, patientId }) {
-  const deliveryRef = db.collection("reminderDeliveries").doc(reminderKey);
-  const timestamp = admin.firestore.FieldValue.serverTimestamp();
-
-  await Promise.all([
-    deliveryRef.set(
-      {
-        reminderKey,
-        medicineId: doc.id,
-        patientId,
-        reminderState: "expired",
-        reminderLeaseUntil: null,
-        reminderExpiredAt: timestamp,
-        updatedAt: timestamp,
-      },
-      { merge: true }
-    ),
-    doc.ref.set(
-      {
-        reminderExpired: true,
-        reminderExpiredAt: timestamp,
-      },
-      { merge: true }
-    ),
-  ]);
-}
-
 async function checkMedicineReminders() {
   const today = getTodayTaipeiDateText();
   const nowTime = getNowTaipeiTimeText();
-  const nowMinutes = timeTextToMinutes(nowTime);
+  const now = new Date();
   const snapshot = await db
     .collection("medicines")
-    .where("date", "==", today)
     .where("isDone", "==", false)
     .get();
   const summary = {
@@ -836,7 +852,6 @@ async function checkMedicineReminders() {
     claimedCount: 0,
     completedCount: 0,
     retryCount: 0,
-    expiredCount: 0,
     skippedCount: 0,
     failedCount: 0,
   };
@@ -851,28 +866,25 @@ async function checkMedicineReminders() {
     const medicineTime = data.time || "";
     const doseIndex = data.doseIndex || 1;
     const totalDoses = parseInt(data.times || "1", 10) || 1;
-    const medicineMinutes = timeTextToMinutes(medicineTime);
+    const scheduledAt = buildScheduledDate(data.date, medicineTime);
+    const cycle = getReminderCycle({
+      scheduledAt,
+      now,
+      isDone: data.isDone === true,
+    });
     const reminderKey = buildReminderKey(
       medicineId,
-      today,
+      data.date || "",
       medicineTime
     );
 
     if (
       !patientId ||
       !reminderKey ||
-      medicineMinutes === null ||
-      nowMinutes === null ||
-      medicineMinutes > nowMinutes ||
-      data.reminderSent === true
+      !scheduledAt ||
+      !cycle
     ) {
       summary.skippedCount++;
-      continue;
-    }
-
-    if (isExpired({ nowMinutes, medicineMinutes })) {
-      await expireReminder({ doc, reminderKey, patientId });
-      summary.expiredCount++;
       continue;
     }
 
@@ -881,6 +893,8 @@ async function checkMedicineReminders() {
         reminderKey,
         medicineId,
         patientId,
+        medicineRef: doc.ref,
+        cycle,
       });
 
       if (!claim.claimed) {
@@ -894,7 +908,10 @@ async function checkMedicineReminders() {
       }
 
       const result = await processReminder({
-        delivery: claim.delivery,
+        delivery: prepareCycleDelivery(
+          claim.delivery,
+          cycle.cycleKey
+        ),
         medicineBoxRequired:
           claim.delivery.medicineBoxRequired !== false,
         sendPhone: () =>
@@ -906,13 +923,19 @@ async function checkMedicineReminders() {
             doseIndex,
             totalDoses,
             reminderKey,
+            repeatCount: cycle.repeatCount,
           }),
         queueMedicineBox: () =>
           queueMedicineBoxCommand(patientId, "beep"),
       });
       const timestamp = admin.firestore.FieldValue.serverTimestamp();
+      const cycleState = buildCycleDeliveryState({ cycle, result });
       const deliveryUpdate = {
-        reminderState: result.completed ? "completed" : "pending",
+        ...cycleState,
+        scheduledMedicineAt:
+          admin.firestore.Timestamp.fromDate(scheduledAt),
+        nextRepeatAt:
+          admin.firestore.Timestamp.fromDate(cycleState.nextRepeatAt),
         reminderLeaseUntil: null,
         phoneNotificationSent: result.phoneNotificationSent,
         phoneNotificationResult: result.phoneNotificationResult,
@@ -931,11 +954,17 @@ async function checkMedicineReminders() {
       }
       if (result.completed) {
         deliveryUpdate.reminderCompletedAt = timestamp;
+        deliveryUpdate.currentCycleCompletedAt = timestamp;
+        if (cycle.repeatCount === 0) {
+          deliveryUpdate.initialReminderCompletedAt = timestamp;
+        } else {
+          deliveryUpdate.lastRepeatAt = timestamp;
+        }
       }
 
       await claim.deliveryRef.set(deliveryUpdate, { merge: true });
 
-      if (result.completed) {
+      if (result.completed && cycle.repeatCount === 0) {
         await doc.ref.set(
           {
             reminderSent: true,
@@ -946,8 +975,7 @@ async function checkMedicineReminders() {
           },
           { merge: true }
         );
-        summary.completedCount++;
-      } else {
+      } else if (!result.completed) {
         await doc.ref.set(
           {
             reminderError: result.errors.join("; "),
@@ -956,6 +984,9 @@ async function checkMedicineReminders() {
           { merge: true }
         );
         summary.failedCount++;
+      }
+      if (result.completed) {
+        summary.completedCount++;
       }
     } catch (error) {
       summary.failedCount++;

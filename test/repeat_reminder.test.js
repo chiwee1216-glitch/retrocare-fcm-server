@@ -2,6 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  buildCycleDeliveryState,
+  prepareCycleDelivery,
   getReminderCycle,
   shouldClaimCycle,
 } = require("../repeat_reminder");
@@ -91,5 +93,69 @@ test("claims a new cycle or an unfinished current cycle only", () => {
       "repeat-1"
     ),
     true
+  );
+});
+
+test("resets channel state only when entering a new cycle", () => {
+  assert.deepEqual(
+    prepareCycleDelivery(
+      {
+        currentCycleKey: "initial",
+        currentCyclePhoneSent: true,
+        currentCycleMedicineBoxQueued: false,
+        medicineBoxRequired: true,
+      },
+      "initial"
+    ),
+    {
+      phoneNotificationSent: true,
+      medicineBoxCommandQueued: false,
+      medicineBoxRequired: true,
+    }
+  );
+
+  assert.deepEqual(
+    prepareCycleDelivery(
+      {
+        currentCycleKey: "initial",
+        currentCyclePhoneSent: true,
+        currentCycleMedicineBoxQueued: true,
+        medicineBoxRequired: true,
+      },
+      "repeat-1"
+    ),
+    {
+      phoneNotificationSent: false,
+      medicineBoxCommandQueued: false,
+      medicineBoxRequired: true,
+    }
+  );
+});
+
+test("stores a completed cycle while keeping the reminder active", () => {
+  const state = buildCycleDeliveryState({
+    cycle: {
+      cycleKey: "repeat-2",
+      repeatCount: 2,
+      dueAt: new Date("2026-06-12T06:10:00.000Z"),
+    },
+    result: {
+      phoneNotificationSent: true,
+      medicineBoxRequired: true,
+      medicineBoxCommandQueued: true,
+      completed: true,
+      errors: [],
+    },
+  });
+
+  assert.equal(state.reminderState, "pending");
+  assert.equal(state.currentCycleKey, "repeat-2");
+  assert.equal(state.currentCycleCompleted, true);
+  assert.equal(state.currentCyclePhoneSent, true);
+  assert.equal(state.currentCycleMedicineBoxQueued, true);
+  assert.equal(state.repeatCount, 2);
+  assert.equal(
+    state.nextRepeatAt.toISOString(),
+    "2026-06-12T06:15:00.000Z"
   );
 });
