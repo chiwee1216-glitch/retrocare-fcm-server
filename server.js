@@ -16,6 +16,7 @@ const { processReminder } = require("./reminder_scheduler");
 const {
   buildCycleDeliveryState,
   getReminderCycle,
+  isRepeatReminderEligible,
   prepareCycleDelivery,
   shouldClaimCycle,
 } = require("./repeat_reminder");
@@ -882,6 +883,7 @@ async function checkMedicineReminders() {
       !patientId ||
       !reminderKey ||
       !scheduledAt ||
+      !isRepeatReminderEligible(scheduledAt) ||
       !cycle
     ) {
       summary.skippedCount++;

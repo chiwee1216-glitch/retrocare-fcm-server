@@ -1,4 +1,15 @@
 const REPEAT_INTERVAL_MS = 5 * 60 * 1000;
+const REPEAT_REMINDER_ROLLOUT_AT = new Date(
+  "2026-06-11T16:00:00.000Z"
+);
+
+function isRepeatReminderEligible(scheduledAt) {
+  const scheduledMillis = scheduledAt?.getTime?.();
+  return (
+    Number.isFinite(scheduledMillis) &&
+    scheduledMillis >= REPEAT_REMINDER_ROLLOUT_AT.getTime()
+  );
+}
 
 function getReminderCycle({ scheduledAt, now, isDone }) {
   if (isDone) return null;
@@ -67,6 +78,7 @@ module.exports = {
   REPEAT_INTERVAL_MS,
   buildCycleDeliveryState,
   getReminderCycle,
+  isRepeatReminderEligible,
   prepareCycleDelivery,
   shouldClaimCycle,
 };

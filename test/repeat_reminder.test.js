@@ -5,6 +5,7 @@ const {
   buildCycleDeliveryState,
   prepareCycleDelivery,
   getReminderCycle,
+  isRepeatReminderEligible,
   shouldClaimCycle,
 } = require("../repeat_reminder");
 
@@ -157,5 +158,20 @@ test("stores a completed cycle while keeping the reminder active", () => {
   assert.equal(
     state.nextRepeatAt.toISOString(),
     "2026-06-12T06:15:00.000Z"
+  );
+});
+
+test("does not activate repeating reminders for pre-rollout legacy data", () => {
+  assert.equal(
+    isRepeatReminderEligible(
+      new Date("2026-05-19T02:43:00.000Z")
+    ),
+    false
+  );
+  assert.equal(
+    isRepeatReminderEligible(
+      new Date("2026-06-11T16:00:00.000Z")
+    ),
+    true
   );
 });
