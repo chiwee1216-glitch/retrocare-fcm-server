@@ -13,6 +13,10 @@ const {
   isExpired,
 } = require("./reminder_delivery");
 const { processReminder } = require("./reminder_scheduler");
+const {
+  findNewTakenSlots,
+  selectMedicineForTakenEvent,
+} = require("./medicine_taken");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -189,31 +193,61 @@ app.post("/register-fcm-token", authenticateFirebaseUser, async (req, res) => {
 app.post("/device/report", authenticateMedicineBox, async (req, res) => {
   try {
     const deviceRef = db.collection("devices").doc(req.deviceId);
-    const deviceDoc = await deviceRef.get();
+    const body = req.body || {};
+    const slots = Array.isArray(body.status?.slots) ? body.status.slots : [];
+    const reportResult = await db.runTransaction(async (transaction) => {
+      const deviceDoc = await transaction.get(deviceRef);
 
-    if (!deviceDoc.exists) {
+      if (!deviceDoc.exists) {
+        return { registered: false, newTakenSlots: [] };
+      }
+
+      const deviceData = deviceDoc.data() || {};
+      const takenResult = findNewTakenSlots({
+        previousActiveSlots: deviceData.activeTakenSlots || [],
+        slots,
+      });
+
+      transaction.set(
+        deviceRef,
+        {
+          status: body.status || {},
+          activeTakenSlots: takenResult.activeSlots,
+          localIp: body.localIp || "",
+          firmwareVersion: body.firmwareVersion || "",
+          lastCommandId: body.lastCommandId || "",
+          lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      return {
+        registered: true,
+        patientId: deviceData.patientId || "",
+        newTakenSlots: takenResult.newTakenSlots,
+      };
+    });
+
+    if (!reportResult.registered) {
       return res.status(404).json({
         success: false,
         message: "Register this device ID in the app first",
       });
     }
 
-    const body = req.body || {};
-
-    await deviceRef.set(
-      {
-        status: body.status || {},
-        localIp: body.localIp || "",
-        firmwareVersion: body.firmwareVersion || "",
-        lastCommandId: body.lastCommandId || "",
-        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    const completedMedicineIds = await persistTakenEvents({
+      deviceId: req.deviceId,
+      patientId: reportResult.patientId,
+      slotNames: reportResult.newTakenSlots,
+    });
 
     triggerReminderCheck();
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      takenEventCount: reportResult.newTakenSlots.length,
+      completedMedicineIds,
+    });
   } catch (error) {
     console.error("device report error:", error);
     return res.status(500).json({
@@ -222,6 +256,91 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
     });
   }
 });
+
+function buildScheduledDate(dateText, timeText) {
+  const normalizedDate = String(dateText || "").replace(/\//g, "-");
+  const normalizedTime = String(timeText || "").trim();
+  const value = new Date(`${normalizedDate}T${normalizedTime}:00+08:00`);
+  return Number.isNaN(value.getTime()) ? null : value;
+}
+
+async function persistTakenEvents({
+  deviceId,
+  patientId,
+  slotNames,
+}) {
+  if (!patientId || slotNames.length === 0) return [];
+
+  const medicinesSnapshot = await db
+    .collection("medicines")
+    .where("patientId", "==", patientId)
+    .get();
+  const medicines = medicinesSnapshot.docs.map((doc) => {
+    const data = doc.data() || {};
+    return {
+      id: doc.id,
+      ref: doc.ref,
+      patientId: data.patientId || "",
+      isDone: data.isDone === true,
+      scheduledAt: buildScheduledDate(data.date, data.time),
+    };
+  });
+  const completedMedicineIds = [];
+
+  for (const slotName of slotNames) {
+    const now = new Date();
+    const selected = selectMedicineForTakenEvent({
+      patientId,
+      now,
+      medicines,
+    });
+    const eventRef = db.collection("deviceTakenEvents").doc();
+    const eventData = {
+      deviceId,
+      patientId,
+      slotName,
+      detectedAt: admin.firestore.FieldValue.serverTimestamp(),
+      matchedMedicineId: selected?.id || "",
+    };
+
+    if (!selected) {
+      await eventRef.set(eventData);
+      continue;
+    }
+
+    const completed = await db.runTransaction(async (transaction) => {
+      const medicineDoc = await transaction.get(selected.ref);
+      if (!medicineDoc.exists || medicineDoc.data()?.isDone === true) {
+        transaction.set(eventRef, {
+          ...eventData,
+          matchedMedicineId: "",
+          matchError: "medicine_already_completed",
+        });
+        return false;
+      }
+
+      transaction.set(
+        selected.ref,
+        {
+          isDone: true,
+          completedByMedicineBox: true,
+          completedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      transaction.set(eventRef, eventData);
+      return true;
+    });
+
+    if (completed) {
+      completedMedicineIds.push(selected.id);
+      selected.isDone = true;
+    }
+  }
+
+  return completedMedicineIds;
+}
 
 app.get("/device/config", authenticateMedicineBox, async (req, res) => {
   try {
