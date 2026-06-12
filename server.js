@@ -6,6 +6,12 @@ const {
   buildMedicineCreatedMessage,
 } = require("./notification_payload");
 const { planTokenOwnership } = require("./fcm_token_ownership");
+const {
+  buildReminderKey,
+  isCronAuthorized,
+  isExpired,
+} = require("./reminder_delivery");
+const { processReminder } = require("./reminder_scheduler");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -46,6 +52,31 @@ function authenticateMedicineBox(req, res, next) {
   }
 
   req.deviceId = deviceId;
+  next();
+}
+
+function authenticateCron(req, res, next) {
+  const configuredSecret = String(process.env.CRON_SECRET || "");
+
+  if (!configuredSecret) {
+    return res.status(503).json({
+      success: false,
+      message: "CRON_SECRET is not configured",
+    });
+  }
+
+  if (
+    !isCronAuthorized(
+      String(req.header("x-cron-secret") || ""),
+      configuredSecret
+    )
+  ) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid cron credentials",
+    });
+  }
+
   next();
 }
 
@@ -320,12 +351,51 @@ async function sendMedicineNotification({
     },
   });
   const response = await admin.messaging().sendEachForMulticast(message);
+  const invalidTokens = response.responses
+    .map((item, index) => {
+      const code = item.error?.code || "";
+      return code === "messaging/registration-token-not-registered" ||
+        code === "messaging/invalid-registration-token"
+        ? message.tokens[index]
+        : "";
+    })
+    .filter(Boolean);
+
+  if (invalidTokens.length > 0) {
+    await removeInvalidFcmTokens(invalidTokens);
+  }
 
   return {
-    success: true,
+    success: response.successCount > 0,
     successCount: response.successCount,
     failureCount: response.failureCount,
+    invalidTokenCount: invalidTokens.length,
   };
+}
+
+async function removeInvalidFcmTokens(tokens) {
+  const uniqueTokens = [...new Set(tokens.filter(Boolean))];
+
+  for (const token of uniqueTokens) {
+    const snapshot = await db
+      .collection("users")
+      .where("fcmTokens", "array-contains", token)
+      .get();
+    const batch = db.batch();
+
+    for (const doc of snapshot.docs) {
+      batch.set(
+        doc.ref,
+        {
+          fcmTokens: admin.firestore.FieldValue.arrayRemove(token),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    await batch.commit();
+  }
 }
 
 // 原本：立即推播
@@ -536,136 +606,263 @@ function timeTextToMinutes(value) {
   return hour * 60 + minute;
 }
 
-async function checkMedicineReminders() {
-    const today = getTodayTaipeiDateText();
-    const nowTime = getNowTaipeiTimeText();
-    const nowMinutes = timeTextToMinutes(nowTime);
+async function claimReminderDelivery({
+  reminderKey,
+  medicineId,
+  patientId,
+}) {
+  const deliveryRef = db.collection("reminderDeliveries").doc(reminderKey);
+  const nowMillis = Date.now();
+  const leaseUntilMillis = nowMillis + 2 * 60 * 1000;
 
-    console.log(`開始檢查服藥提醒：date=${today}, time=${nowTime}`);
+  return db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(deliveryRef);
+    const delivery = snapshot.exists ? snapshot.data() || {} : {};
+    const leaseUntil = delivery.reminderLeaseUntil?.toMillis?.() || 0;
 
-    const snapshot = await db
-      .collection("medicines")
-      .where("date", "==", today)
-      .where("isDone", "==", false)
-      .get();
-
-    let checkedCount = 0;
-    let sentCount = 0;
-    let skippedCount = 0;
-    let failedCount = 0;
-
-    for (const doc of snapshot.docs) {
-      checkedCount++;
-
-      const data = doc.data();
-
-      const medicineId = doc.id;
-      const patientId = data.patientId || "";
-      const caregiverId = data.caregiverId || "";
-      const medicineName = data.name || "藥物";
-      const medicineTime = data.time || "";
-      const doseIndex = data.doseIndex || 1;
-      const totalDoses = parseInt(data.times || "1", 10) || 1;
-      const reminderSent = data.reminderSent === true;
-      const medicineMinutes = timeTextToMinutes(medicineTime);
-
-      if (!patientId || medicineMinutes === null || nowMinutes === null) {
-        skippedCount++;
-        continue;
-      }
-
-      // 還沒到時間
-      if (medicineMinutes > nowMinutes) {
-        skippedCount++;
-        continue;
-      }
-
-      // 已經發過，避免重複推播
-      if (reminderSent) {
-        skippedCount++;
-        continue;
-      }
-
-      // 避免伺服器重新部署時一次補送很久以前的舊提醒。
-      if (nowMinutes - medicineMinutes > 10) {
-        await doc.ref.set(
-          {
-            reminderExpired: true,
-            reminderExpiredAt:
-              admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-        skippedCount++;
-        continue;
-      }
-
-      try {
-        const result = await sendMedicineNotification({
-          patientId,
-          caregiverId,
-          medicineName,
-          medicineTime,
-          doseIndex,
-          totalDoses,
-          reminderKey: `${medicineId}_${today}_${medicineTime}`,
-        });
-        const medicineBoxResult = await queueMedicineBoxCommand(
-          patientId,
-          "beep"
-        );
-
-        await db.collection("medicines").doc(medicineId).set(
-          {
-            reminderSent: true,
-            reminderSentAt: admin.firestore.FieldValue.serverTimestamp(),
-            reminderResult: result,
-            medicineBoxReminderResult: medicineBoxResult,
-          },
-          { merge: true }
-        );
-
-        sentCount++;
-
-        console.log(`已推播服藥提醒：${medicineName} ${medicineTime}`);
-      } catch (error) {
-        failedCount++;
-
-        console.error(`服藥提醒推播失敗 medicineId=${medicineId}`, error);
-
-        await db.collection("medicines").doc(medicineId).set(
-          {
-            reminderError: error.message,
-            reminderErrorAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-      }
+    if (
+      delivery.reminderState === "completed" ||
+      delivery.reminderState === "expired"
+    ) {
+      return { claimed: false, delivery, reason: delivery.reminderState };
     }
 
-    return {
-      success: true,
-      today,
-      nowTime,
-      checkedCount,
-      sentCount,
-      skippedCount,
-      failedCount,
+    if (
+      delivery.reminderState === "processing" &&
+      leaseUntil > nowMillis
+    ) {
+      return { claimed: false, delivery, reason: "leased" };
+    }
+
+    const reminderAttemptCount =
+      Number(delivery.reminderAttemptCount || 0) + 1;
+    const claimedDelivery = {
+      ...delivery,
+      reminderKey,
+      medicineId,
+      patientId,
+      reminderState: "processing",
+      reminderAttemptCount,
+      reminderLeaseUntil:
+        admin.firestore.Timestamp.fromMillis(leaseUntilMillis),
     };
+
+    transaction.set(
+      deliveryRef,
+      {
+        reminderKey,
+        medicineId,
+        patientId,
+        reminderState: "processing",
+        reminderAttemptCount,
+        reminderLeaseUntil:
+          admin.firestore.Timestamp.fromMillis(leaseUntilMillis),
+        reminderLastAttemptAt:
+          admin.firestore.FieldValue.serverTimestamp(),
+        createdAt:
+          delivery.createdAt ||
+          admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    return { claimed: true, delivery: claimedDelivery, deliveryRef };
+  });
 }
 
-// 檢查服藥時間，到時間就推播
-app.get("/check-medicine-reminders", async (req, res) => {
-  try {
-    return res.json(await checkMedicineReminders());
-  } catch (error) {
-    console.error("檢查服藥提醒失敗：", error);
-    return res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+async function expireReminder({ doc, reminderKey, patientId }) {
+  const deliveryRef = db.collection("reminderDeliveries").doc(reminderKey);
+  const timestamp = admin.firestore.FieldValue.serverTimestamp();
+
+  await Promise.all([
+    deliveryRef.set(
+      {
+        reminderKey,
+        medicineId: doc.id,
+        patientId,
+        reminderState: "expired",
+        reminderLeaseUntil: null,
+        reminderExpiredAt: timestamp,
+        updatedAt: timestamp,
+      },
+      { merge: true }
+    ),
+    doc.ref.set(
+      {
+        reminderExpired: true,
+        reminderExpiredAt: timestamp,
+      },
+      { merge: true }
+    ),
+  ]);
+}
+
+async function checkMedicineReminders() {
+  const today = getTodayTaipeiDateText();
+  const nowTime = getNowTaipeiTimeText();
+  const nowMinutes = timeTextToMinutes(nowTime);
+  const snapshot = await db
+    .collection("medicines")
+    .where("date", "==", today)
+    .where("isDone", "==", false)
+    .get();
+  const summary = {
+    success: true,
+    today,
+    nowTime,
+    checkedCount: 0,
+    claimedCount: 0,
+    completedCount: 0,
+    retryCount: 0,
+    expiredCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+  };
+
+  for (const doc of snapshot.docs) {
+    summary.checkedCount++;
+    const data = doc.data() || {};
+    const medicineId = doc.id;
+    const patientId = data.patientId || "";
+    const caregiverId = data.caregiverId || "";
+    const medicineName = data.name || "藥物";
+    const medicineTime = data.time || "";
+    const doseIndex = data.doseIndex || 1;
+    const totalDoses = parseInt(data.times || "1", 10) || 1;
+    const medicineMinutes = timeTextToMinutes(medicineTime);
+    const reminderKey = buildReminderKey(
+      medicineId,
+      today,
+      medicineTime
+    );
+
+    if (
+      !patientId ||
+      !reminderKey ||
+      medicineMinutes === null ||
+      nowMinutes === null ||
+      medicineMinutes > nowMinutes ||
+      data.reminderSent === true
+    ) {
+      summary.skippedCount++;
+      continue;
+    }
+
+    if (isExpired({ nowMinutes, medicineMinutes })) {
+      await expireReminder({ doc, reminderKey, patientId });
+      summary.expiredCount++;
+      continue;
+    }
+
+    try {
+      const claim = await claimReminderDelivery({
+        reminderKey,
+        medicineId,
+        patientId,
+      });
+
+      if (!claim.claimed) {
+        summary.skippedCount++;
+        continue;
+      }
+
+      summary.claimedCount++;
+      if (Number(claim.delivery.reminderAttemptCount || 0) > 1) {
+        summary.retryCount++;
+      }
+
+      const result = await processReminder({
+        delivery: claim.delivery,
+        medicineBoxRequired:
+          claim.delivery.medicineBoxRequired !== false,
+        sendPhone: () =>
+          sendMedicineNotification({
+            patientId,
+            caregiverId,
+            medicineName,
+            medicineTime,
+            doseIndex,
+            totalDoses,
+            reminderKey,
+          }),
+        queueMedicineBox: () =>
+          queueMedicineBoxCommand(patientId, "beep"),
+      });
+      const timestamp = admin.firestore.FieldValue.serverTimestamp();
+      const deliveryUpdate = {
+        reminderState: result.completed ? "completed" : "pending",
+        reminderLeaseUntil: null,
+        phoneNotificationSent: result.phoneNotificationSent,
+        phoneNotificationResult: result.phoneNotificationResult,
+        medicineBoxRequired: result.medicineBoxRequired,
+        medicineBoxCommandQueued: result.medicineBoxCommandQueued,
+        medicineBoxResult: result.medicineBoxResult,
+        reminderLastError: result.errors.join("; "),
+        updatedAt: timestamp,
+      };
+
+      if (result.phoneNotificationSent) {
+        deliveryUpdate.phoneNotificationSentAt = timestamp;
+      }
+      if (result.medicineBoxCommandQueued) {
+        deliveryUpdate.medicineBoxCommandQueuedAt = timestamp;
+      }
+      if (result.completed) {
+        deliveryUpdate.reminderCompletedAt = timestamp;
+      }
+
+      await claim.deliveryRef.set(deliveryUpdate, { merge: true });
+
+      if (result.completed) {
+        await doc.ref.set(
+          {
+            reminderSent: true,
+            reminderSentAt: timestamp,
+            reminderResult: result.phoneNotificationResult,
+            medicineBoxReminderResult: result.medicineBoxResult,
+            reminderError: "",
+          },
+          { merge: true }
+        );
+        summary.completedCount++;
+      } else {
+        await doc.ref.set(
+          {
+            reminderError: result.errors.join("; "),
+            reminderErrorAt: timestamp,
+          },
+          { merge: true }
+        );
+        summary.failedCount++;
+      }
+    } catch (error) {
+      summary.failedCount++;
+      console.error(
+        `Medicine reminder failed reminderKey=${reminderKey}`,
+        error
+      );
+    }
   }
-});
+
+  return summary;
+}
+
+app.post(
+  "/internal/check-medicine-reminders",
+  authenticateCron,
+  async (req, res) => {
+    try {
+      return res.json(await checkMedicineReminders());
+    } catch (error) {
+      console.error("Medicine reminder check endpoint failed:", error);
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  }
+);
 
 function triggerReminderCheck({ force = false } = {}) {
   const now = Date.now();
@@ -684,7 +881,7 @@ function triggerReminderCheck({ force = false } = {}) {
   Promise.resolve()
     .then(() => checkMedicineReminders())
     .then((result) => {
-      if (result.sentCount > 0 || result.failedCount > 0) {
+      if (result.completedCount > 0 || result.failedCount > 0) {
         console.log("Medicine reminder check result:", result);
       }
     })
