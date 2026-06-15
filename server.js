@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const admin = require("firebase-admin");
 const {
   buildMedicineOverdueMessage,
@@ -20,10 +21,11 @@ const {
   prepareCycleDelivery,
   shouldClaimCycle,
 } = require("./repeat_reminder");
+const { buildDailySchedules, normalizeDate } = require("./medicine_schedule");
 const {
-  findNewTakenSlots,
-  selectMedicineForTakenEvent,
-} = require("./medicine_taken");
+  classifyPackageRemoved,
+  normalizeSlotIndex,
+} = require("./medicine_box_event");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -202,24 +204,53 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
     const deviceRef = db.collection("devices").doc(req.deviceId);
     const body = req.body || {};
     const slots = Array.isArray(body.status?.slots) ? body.status.slots : [];
+    const reportedEvents = Array.isArray(body.events) ? body.events : [];
     const reportResult = await db.runTransaction(async (transaction) => {
       const deviceDoc = await transaction.get(deviceRef);
 
       if (!deviceDoc.exists) {
-        return { registered: false, newTakenSlots: [] };
+        return { registered: false, legacyEvents: [] };
       }
 
       const deviceData = deviceDoc.data() || {};
-      const takenResult = findNewTakenSlots({
-        previousActiveSlots: deviceData.activeTakenSlots || [],
-        slots,
+      const previousActiveSlots = new Set(
+        (deviceData.activeTakenSlots || [])
+          .map(normalizeSlotIndex)
+          .filter(Boolean)
+      );
+      const activeTakenSlots = slots
+        .filter((slot) => slot?.taken === true)
+        .map(normalizeSlotIndex)
+        .filter(Boolean);
+      const legacyEvents =
+        reportedEvents.length > 0
+          ? []
+          : activeTakenSlots
+              .filter((slotIndex) => !previousActiveSlots.has(slotIndex))
+              .map((slotIndex) => ({
+                eventId: `${req.deviceId}-legacy-${slotIndex}-${Date.now()}`,
+                type: "package_removed",
+                slotIndex,
+                occurredAt: new Date().toISOString(),
+              }));
+      const normalizedSlots = slots.map((slot) => {
+        const slotIndex = normalizeSlotIndex(slot);
+        return {
+          ...slot,
+          ...(slotIndex
+            ? { slotIndex, slot: `第 ${slotIndex} 格` }
+            : {}),
+        };
       });
 
       transaction.set(
         deviceRef,
         {
-          status: body.status || {},
-          activeTakenSlots: takenResult.activeSlots,
+          status: {
+            ...(body.status || {}),
+            slots: normalizedSlots,
+          },
+          activeTakenSlots,
           localIp: body.localIp || "",
           firmwareVersion: body.firmwareVersion || "",
           lastCommandId: body.lastCommandId || "",
@@ -231,7 +262,7 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
       return {
         registered: true,
         patientId: deviceData.patientId || "",
-        newTakenSlots: takenResult.newTakenSlots,
+        legacyEvents,
       };
     });
 
@@ -242,18 +273,22 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
       });
     }
 
-    const completedMedicineIds = await persistTakenEvents({
+    const eventResult = await persistMedicineBoxEvents({
       deviceId: req.deviceId,
       patientId: reportResult.patientId,
-      slotNames: reportResult.newTakenSlots,
+      events:
+        reportedEvents.length > 0
+          ? reportedEvents
+          : reportResult.legacyEvents,
     });
 
     triggerReminderCheck();
 
     return res.json({
       success: true,
-      takenEventCount: reportResult.newTakenSlots.length,
-      completedMedicineIds,
+      processedEventCount: eventResult.processedEventCount,
+      completedMedicineIds: eventResult.completedMedicineIds,
+      exceptionIds: eventResult.exceptionIds,
     });
   } catch (error) {
     console.error("device report error:", error);
@@ -264,89 +299,272 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
   }
 });
 
+function taipeiDateText(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  })
+    .format(date)
+    .replace(/-/g, "/");
+}
+
+function stableDocumentId(value) {
+  return crypto.createHash("sha256").update(String(value)).digest("hex");
+}
+
+function parseEventDate(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? new Date() : date;
+  }
+
+  const date = new Date(String(value || ""));
+  return Number.isNaN(date.getTime()) ? new Date() : date;
+}
+
+async function ensureDailySchedules(patientId, dateText) {
+  const medicinesSnapshot = await db
+    .collection("medicines")
+    .where("patientId", "==", patientId)
+    .get();
+  const medicines = medicinesSnapshot.docs
+    .map((doc) => ({ id: doc.id, ...doc.data() }))
+    .filter((medicine) => normalizeDate(medicine.date) === dateText);
+  const builtSchedules = buildDailySchedules(medicines);
+  const scheduleEntries = await Promise.all(
+    builtSchedules.map(async (schedule) => {
+      const id = stableDocumentId(
+        `${schedule.patientId}:${schedule.date}:${schedule.time}`
+      );
+      const ref = db.collection("medicineSchedules").doc(id);
+      const existing = await ref.get();
+      const currentData = existing.data() || {};
+
+      return {
+        ...schedule,
+        id,
+        ref,
+        status: currentData.status || schedule.status,
+        completedAt: currentData.completedAt || null,
+      };
+    })
+  );
+  const batch = db.batch();
+
+  for (const schedule of scheduleEntries) {
+    batch.set(
+      schedule.ref,
+      {
+        patientId: schedule.patientId,
+        caregiverId: schedule.caregiverId,
+        date: schedule.date,
+        time: schedule.time,
+        slotIndex: schedule.slotIndex,
+        medicineIds: schedule.medicineIds,
+        medicineItems: schedule.medicineItems,
+        scheduledAt: admin.firestore.Timestamp.fromDate(schedule.scheduledAt),
+        normalWindowStart: admin.firestore.Timestamp.fromDate(
+          schedule.normalWindowStart
+        ),
+        normalWindowEnd: admin.firestore.Timestamp.fromDate(
+          schedule.normalWindowEnd
+        ),
+        status: schedule.status,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+
+  if (scheduleEntries.length > 0) {
+    await batch.commit();
+  }
+
+  return scheduleEntries;
+}
+
+async function persistMedicineBoxEvents({ deviceId, patientId, events }) {
+  if (!patientId || !Array.isArray(events) || events.length === 0) {
+    return {
+      processedEventCount: 0,
+      completedMedicineIds: [],
+      exceptionIds: [],
+    };
+  }
+
+  const completedMedicineIds = [];
+  const exceptionIds = [];
+  let processedEventCount = 0;
+  const schedulesByDate = new Map();
+
+  for (const rawEvent of events) {
+    const eventId = String(rawEvent?.eventId || "").trim();
+    const type = String(rawEvent?.type || "").trim();
+
+    if (!eventId || !type) continue;
+
+    const occurredAt = parseEventDate(rawEvent.occurredAt);
+    const dateText = taipeiDateText(occurredAt);
+    const eventDocumentId = stableDocumentId(`${deviceId}:${eventId}`);
+    const eventRef = db.collection("medicineBoxEvents").doc(eventDocumentId);
+    const existingEvent = await eventRef.get();
+
+    if (existingEvent.exists) continue;
+
+    if (!schedulesByDate.has(dateText)) {
+      schedulesByDate.set(
+        dateText,
+        await ensureDailySchedules(patientId, dateText)
+      );
+    }
+
+    const schedules = schedulesByDate.get(dateText);
+    const slotIndex = normalizeSlotIndex(rawEvent.slotIndex ?? rawEvent.slot);
+    const baseEventData = {
+      eventId,
+      type,
+      deviceId,
+      patientId,
+      slotIndex,
+      occurredAt: admin.firestore.Timestamp.fromDate(occurredAt),
+      receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (type !== "package_removed") {
+      await eventRef.create(baseEventData);
+      processedEventCount += 1;
+      continue;
+    }
+
+    const classification = classifyPackageRemoved({
+      slotIndex,
+      occurredAt,
+      schedules,
+    });
+    const schedule = schedules.find(
+      (item) => item.id === classification.scheduleId
+    );
+
+    if (classification.kind === "normal" && schedule) {
+      const completed = await db.runTransaction(async (transaction) => {
+        const [freshEvent, freshSchedule] = await Promise.all([
+          transaction.get(eventRef),
+          transaction.get(schedule.ref),
+        ]);
+
+        if (freshEvent.exists) return false;
+        const currentStatus = freshSchedule.data()?.status || "scheduled";
+
+        if (currentStatus === "completed") {
+          transaction.create(eventRef, {
+            ...baseEventData,
+            result: "ignored_already_completed",
+            scheduleId: schedule.id,
+          });
+          return false;
+        }
+
+        transaction.set(
+          schedule.ref,
+          {
+            status: "completed",
+            actualTakenAt: admin.firestore.Timestamp.fromDate(occurredAt),
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+            completedByMedicineBox: true,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+        for (const medicineId of schedule.medicineIds) {
+          transaction.set(
+            db.collection("medicines").doc(medicineId),
+            {
+              isDone: true,
+              slotIndex: schedule.slotIndex,
+              scheduleId: schedule.id,
+              completedByMedicineBox: true,
+              completedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
+        transaction.create(eventRef, {
+          ...baseEventData,
+          result: "completed",
+          scheduleId: schedule.id,
+          medicineIds: schedule.medicineIds,
+        });
+        return true;
+      });
+
+      if (completed) {
+        schedule.status = "completed";
+        completedMedicineIds.push(...schedule.medicineIds);
+      }
+    } else {
+      const exceptionRef = db
+        .collection("medicineExceptions")
+        .doc(eventDocumentId);
+      await db.runTransaction(async (transaction) => {
+        const freshEvent = await transaction.get(eventRef);
+        if (freshEvent.exists) return;
+
+        transaction.create(eventRef, {
+          ...baseEventData,
+          result: "exception_pending",
+          reason: classification.reason,
+          scheduleId: classification.scheduleId,
+        });
+        transaction.set(
+          exceptionRef,
+          {
+            deviceId,
+            patientId,
+            slotIndex,
+            scheduleId: classification.scheduleId,
+            reason: classification.reason,
+            status: "pending",
+            occurredAt: admin.firestore.Timestamp.fromDate(occurredAt),
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        if (schedule) {
+          transaction.set(
+            schedule.ref,
+            {
+              status: "exception_pending",
+              exceptionId: exceptionRef.id,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
+      });
+
+      if (schedule) schedule.status = "exception_pending";
+      exceptionIds.push(exceptionRef.id);
+    }
+
+    processedEventCount += 1;
+  }
+
+  return {
+    processedEventCount,
+    completedMedicineIds: [...new Set(completedMedicineIds)],
+    exceptionIds: [...new Set(exceptionIds)],
+  };
+}
+
 function buildScheduledDate(dateText, timeText) {
   const normalizedDate = String(dateText || "").replace(/\//g, "-");
   const normalizedTime = String(timeText || "").trim();
   const value = new Date(`${normalizedDate}T${normalizedTime}:00+08:00`);
   return Number.isNaN(value.getTime()) ? null : value;
-}
-
-async function persistTakenEvents({
-  deviceId,
-  patientId,
-  slotNames,
-}) {
-  if (!patientId || slotNames.length === 0) return [];
-
-  const medicinesSnapshot = await db
-    .collection("medicines")
-    .where("patientId", "==", patientId)
-    .get();
-  const medicines = medicinesSnapshot.docs.map((doc) => {
-    const data = doc.data() || {};
-    return {
-      id: doc.id,
-      ref: doc.ref,
-      patientId: data.patientId || "",
-      isDone: data.isDone === true,
-      scheduledAt: buildScheduledDate(data.date, data.time),
-    };
-  });
-  const completedMedicineIds = [];
-
-  for (const slotName of slotNames) {
-    const now = new Date();
-    const selected = selectMedicineForTakenEvent({
-      patientId,
-      now,
-      medicines,
-    });
-    const eventRef = db.collection("deviceTakenEvents").doc();
-    const eventData = {
-      deviceId,
-      patientId,
-      slotName,
-      detectedAt: admin.firestore.FieldValue.serverTimestamp(),
-      matchedMedicineId: selected?.id || "",
-    };
-
-    if (!selected) {
-      await eventRef.set(eventData);
-      continue;
-    }
-
-    const completed = await db.runTransaction(async (transaction) => {
-      const medicineDoc = await transaction.get(selected.ref);
-      if (!medicineDoc.exists || medicineDoc.data()?.isDone === true) {
-        transaction.set(eventRef, {
-          ...eventData,
-          matchedMedicineId: "",
-          matchError: "medicine_already_completed",
-        });
-        return false;
-      }
-
-      transaction.set(
-        selected.ref,
-        {
-          isDone: true,
-          completedByMedicineBox: true,
-          completedAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-      transaction.set(eventRef, eventData);
-      return true;
-    });
-
-    if (completed) {
-      completedMedicineIds.push(selected.id);
-      selected.isDone = true;
-    }
-  }
-
-  return completedMedicineIds;
 }
 
 app.get("/device/config", authenticateMedicineBox, async (req, res) => {
