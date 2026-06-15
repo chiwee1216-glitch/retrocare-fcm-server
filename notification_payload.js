@@ -59,8 +59,28 @@ function buildMedicineReminderMessage({ tokens, title, body, data }) {
 }
 
 function buildMedicineCreatedMessage({ tokens, title, body, data }) {
-  return buildMedicineMessage({
+  return buildMedicineDataMessage({
     type: "medicine_created",
+    tokens,
+    title,
+    body,
+    data,
+  });
+}
+
+function buildMedicineExceptionMessage({ tokens, title, body, data }) {
+  return buildMedicineDataMessage({
+    type: "medicine_exception",
+    tokens,
+    title,
+    body,
+    data,
+  });
+}
+
+function buildMedicineRefillMessage({ tokens, title, body, data }) {
+  return buildMedicineDataMessage({
+    type: "medicine_refill_missing",
     tokens,
     title,
     body,
@@ -81,5 +101,7 @@ function buildMedicineOverdueMessage({ tokens, title, body, data }) {
 module.exports = {
   buildMedicineReminderMessage,
   buildMedicineCreatedMessage,
+  buildMedicineExceptionMessage,
   buildMedicineOverdueMessage,
+  buildMedicineRefillMessage,
 };

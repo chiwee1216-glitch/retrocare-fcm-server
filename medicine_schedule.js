@@ -13,6 +13,13 @@ function scheduleKey({ patientId, date, time }) {
   ].join(":");
 }
 
+function scheduleDocumentId(schedule) {
+  return crypto
+    .createHash("sha256")
+    .update(scheduleKey(schedule))
+    .digest("hex");
+}
+
 function buildScheduledAt(date, time) {
   const normalizedDate = normalizeDate(date).replace(/\//g, "-");
   const normalizedTime = String(time || "").trim();
@@ -80,12 +87,31 @@ function buildDailySchedules(medicines = []) {
   });
 }
 
+function buildScheduleAssignments(medicines = []) {
+  const schedules = buildDailySchedules(medicines).map((schedule) => ({
+    ...schedule,
+    id: scheduleDocumentId(schedule),
+  }));
+  const medicineUpdates = schedules.flatMap((schedule) =>
+    schedule.medicineIds.map((medicineId) => ({
+      medicineId,
+      scheduleId: schedule.id,
+      slotIndex: schedule.slotIndex,
+    }))
+  );
+
+  return { schedules, medicineUpdates };
+}
+
 module.exports = {
   MAX_SLOT_COUNT,
   NORMAL_WINDOW_MINUTES,
   buildDailySchedules,
   buildNormalWindow,
+  buildScheduleAssignments,
   buildScheduledAt,
   normalizeDate,
+  scheduleDocumentId,
   scheduleKey,
 };
+const crypto = require("crypto");

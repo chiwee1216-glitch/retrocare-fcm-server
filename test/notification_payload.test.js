@@ -4,7 +4,9 @@ const assert = require("node:assert/strict");
 const {
   buildMedicineReminderMessage,
   buildMedicineCreatedMessage,
+  buildMedicineExceptionMessage,
   buildMedicineOverdueMessage,
+  buildMedicineRefillMessage,
 } = require("../notification_payload");
 
 test("medicine reminder uses a high-priority data-only payload", () => {
@@ -29,7 +31,7 @@ test("medicine reminder uses a high-priority data-only payload", () => {
   assert.deepEqual(message.tokens, ["token-1"]);
 });
 
-test("medicine-created notification also displays while the app is closed", () => {
+test("medicine-created notification is data-only so the app controls vibration", () => {
   const message = buildMedicineCreatedMessage({
     tokens: ["token-1"],
     title: "已新增服藥提醒：測試藥",
@@ -40,8 +42,8 @@ test("medicine-created notification also displays while the app is closed", () =
     },
   });
 
-  assert.equal(message.notification.title, "已新增服藥提醒：測試藥");
-  assert.equal(message.android.notification.channelId, "medicine_fcm_channel_v6");
+  assert.equal(message.notification, undefined);
+  assert.equal(message.android.priority, "high");
   assert.equal(message.data.type, "medicine_created");
 });
 
@@ -65,4 +67,24 @@ test("overdue reminder has its own notification type", () => {
     message.data.reminderCycleKey,
     "reminder-1:repeat-1"
   );
+});
+
+test("exception and refill payloads include a stable event key", () => {
+  const exception = buildMedicineExceptionMessage({
+    tokens: ["token-1"],
+    title: "異常取藥",
+    body: "請看護確認",
+    data: { eventKey: "exception-1" },
+  });
+  const refill = buildMedicineRefillMessage({
+    tokens: ["token-1"],
+    title: "請補藥",
+    body: "第 1 格尚未補藥",
+    data: { eventKey: "refill-1" },
+  });
+
+  assert.equal(exception.data.type, "medicine_exception");
+  assert.equal(exception.data.eventKey, "exception-1");
+  assert.equal(refill.data.type, "medicine_refill_missing");
+  assert.equal(refill.data.eventKey, "refill-1");
 });

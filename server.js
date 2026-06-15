@@ -6,6 +6,8 @@ const {
   buildMedicineOverdueMessage,
   buildMedicineReminderMessage,
   buildMedicineCreatedMessage,
+  buildMedicineExceptionMessage,
+  buildMedicineRefillMessage,
 } = require("./notification_payload");
 const { planTokenOwnership } = require("./fcm_token_ownership");
 const {
@@ -21,7 +23,10 @@ const {
   prepareCycleDelivery,
   shouldClaimCycle,
 } = require("./repeat_reminder");
-const { buildDailySchedules, normalizeDate } = require("./medicine_schedule");
+const {
+  buildScheduleAssignments,
+  normalizeDate,
+} = require("./medicine_schedule");
 const {
   classifyPackageRemoved,
   normalizeSlotIndex,
@@ -332,12 +337,10 @@ async function ensureDailySchedules(patientId, dateText) {
   const medicines = medicinesSnapshot.docs
     .map((doc) => ({ id: doc.id, ...doc.data() }))
     .filter((medicine) => normalizeDate(medicine.date) === dateText);
-  const builtSchedules = buildDailySchedules(medicines);
+  const { schedules: builtSchedules } = buildScheduleAssignments(medicines);
   const scheduleEntries = await Promise.all(
     builtSchedules.map(async (schedule) => {
-      const id = stableDocumentId(
-        `${schedule.patientId}:${schedule.date}:${schedule.time}`
-      );
+      const id = schedule.id;
       const ref = db.collection("medicineSchedules").doc(id);
       const existing = await ref.get();
       const currentData = existing.data() || {};
@@ -385,6 +388,228 @@ async function ensureDailySchedules(patientId, dateText) {
   return scheduleEntries;
 }
 
+async function canAccessPatient(userId, patientId) {
+  if (!userId || !patientId) return false;
+  if (userId === patientId) return true;
+
+  const [userDoc, patientDoc] = await Promise.all([
+    db.collection("users").doc(userId).get(),
+    db.collection("users").doc(patientId).get(),
+  ]);
+  const userData = userDoc.data() || {};
+  const patientData = patientDoc.data() || {};
+  const linkedPatients = Array.isArray(userData.linkedPatients)
+    ? userData.linkedPatients
+    : [];
+
+  return (
+    String(userData.linkedPatientId || "") === patientId ||
+    linkedPatients.some(
+      (item) => String(item?.patientId || item || "") === patientId
+    ) ||
+    String(patientData.linkedCaregiverId || "") === userId
+  );
+}
+
+app.post(
+  "/medicine-schedules/sync",
+  authenticateFirebaseUser,
+  async (req, res) => {
+    try {
+      const patientId = String(req.body?.patientId || "").trim();
+      const dateText = normalizeDate(req.body?.date);
+
+      if (!patientId || !dateText) {
+        return res.status(400).json({
+          success: false,
+          message: "缺少病人或日期資料",
+        });
+      }
+
+      if (!(await canAccessPatient(req.firebaseUser.uid, patientId))) {
+        return res.status(403).json({
+          success: false,
+          message: "沒有權限管理此病人的服藥時程",
+        });
+      }
+
+      let schedules;
+      try {
+        schedules = await ensureDailySchedules(patientId, dateText);
+      } catch (error) {
+        if (String(error.message).includes("最多支援四個服藥時段")) {
+          return res.status(409).json({
+            success: false,
+            message: error.message,
+          });
+        }
+        throw error;
+      }
+
+      const batch = db.batch();
+      const validScheduleIds = new Set(
+        schedules.map((schedule) => schedule.id)
+      );
+      const existingSchedules = await db
+        .collection("medicineSchedules")
+        .where("patientId", "==", patientId)
+        .get();
+      for (const doc of existingSchedules.docs) {
+        const data = doc.data() || {};
+        if (
+          normalizeDate(data.date) === dateText &&
+          !validScheduleIds.has(doc.id) &&
+          !["completed", "exception_pending"].includes(data.status)
+        ) {
+          batch.delete(doc.ref);
+        }
+      }
+      for (const schedule of schedules) {
+        for (const medicineId of schedule.medicineIds) {
+          batch.set(
+            db.collection("medicines").doc(medicineId),
+            {
+              scheduleId: schedule.id,
+              slotIndex: schedule.slotIndex,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
+      }
+      await batch.commit();
+
+      return res.json({
+        success: true,
+        schedules: schedules.map((schedule) => ({
+          id: schedule.id,
+          date: schedule.date,
+          time: schedule.time,
+          slotIndex: schedule.slotIndex,
+          status: schedule.status,
+          medicineIds: schedule.medicineIds,
+          medicineItems: schedule.medicineItems,
+        })),
+      });
+    } catch (error) {
+      console.error("schedule sync error:", error);
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  }
+);
+
+app.post(
+  "/medicine-exceptions/:id/resolve",
+  authenticateFirebaseUser,
+  async (req, res) => {
+    try {
+      const exceptionRef = db
+        .collection("medicineExceptions")
+        .doc(String(req.params.id || ""));
+      const exceptionDoc = await exceptionRef.get();
+
+      if (!exceptionDoc.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "找不到這筆異常取藥紀錄",
+        });
+      }
+
+      const exception = exceptionDoc.data() || {};
+      const patientId = String(exception.patientId || "");
+      const resolution = String(req.body?.resolution || "");
+
+      if (
+        req.firebaseUser.uid === patientId ||
+        !(await canAccessPatient(req.firebaseUser.uid, patientId))
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "只有綁定的看護可以確認異常取藥",
+        });
+      }
+
+      if (!["confirmed_taken", "confirmed_not_taken"].includes(resolution)) {
+        return res.status(400).json({
+          success: false,
+          message: "異常確認結果不正確",
+        });
+      }
+
+      const scheduleRef = exception.scheduleId
+        ? db.collection("medicineSchedules").doc(exception.scheduleId)
+        : null;
+      await db.runTransaction(async (transaction) => {
+        const scheduleDoc = scheduleRef
+          ? await transaction.get(scheduleRef)
+          : null;
+        const schedule = scheduleDoc?.data() || {};
+
+        transaction.set(
+          exceptionRef,
+          {
+            status: "resolved",
+            resolution,
+            resolvedBy: req.firebaseUser.uid,
+            resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        if (!scheduleRef) return;
+
+        if (resolution === "confirmed_taken") {
+          transaction.set(
+            scheduleRef,
+            {
+              status: "completed",
+              completedAt: admin.firestore.FieldValue.serverTimestamp(),
+              completedByCaregiverConfirmation: true,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+          for (const medicineId of schedule.medicineIds || []) {
+            transaction.set(
+              db.collection("medicines").doc(medicineId),
+              {
+                isDone: true,
+                completedAt: admin.firestore.FieldValue.serverTimestamp(),
+                completedByCaregiverConfirmation: true,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            );
+          }
+        } else {
+          transaction.set(
+            scheduleRef,
+            {
+              status: "reminding",
+              exceptionId: "",
+              nextReminderAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
+      });
+
+      triggerReminderCheck();
+      return res.json({ success: true, resolution });
+    } catch (error) {
+      console.error("resolve medicine exception error:", error);
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  }
+);
+
 async function persistMedicineBoxEvents({ deviceId, patientId, events }) {
   if (!patientId || !Array.isArray(events) || events.length === 0) {
     return {
@@ -401,7 +626,7 @@ async function persistMedicineBoxEvents({ deviceId, patientId, events }) {
 
   for (const rawEvent of events) {
     const eventId = String(rawEvent?.eventId || "").trim();
-    const type = String(rawEvent?.type || "").trim();
+    const type = String(rawEvent?.type || rawEvent?.eventType || "").trim();
 
     if (!eventId || !type) continue;
 
@@ -548,6 +773,21 @@ async function persistMedicineBoxEvents({ deviceId, patientId, events }) {
 
       if (schedule) schedule.status = "exception_pending";
       exceptionIds.push(exceptionRef.id);
+      await sendMedicineEventNotification({
+        userIds: [patientId, schedule?.caregiverId],
+        buildMessage: buildMedicineExceptionMessage,
+        title: "異常取藥，需要看護確認",
+        body: slotIndex
+          ? `第 ${slotIndex} 格在非預定時間取藥，已暫停一般服藥提醒。`
+          : "偵測到未分配藥格的取藥事件，請看護確認。",
+        data: {
+          eventKey: `medicine-exception:${exceptionRef.id}`,
+          exceptionId: exceptionRef.id,
+          patientId,
+          scheduleId: classification.scheduleId,
+          slotIndex: slotIndex || "",
+        },
+      });
     }
 
     processedEventCount += 1;
@@ -733,6 +973,32 @@ async function sendMedicineNotification({
   };
 }
 
+async function sendMedicineEventNotification({
+  userIds,
+  buildMessage,
+  title,
+  body,
+  data,
+}) {
+  const uniqueUserIds = [...new Set(userIds.filter(Boolean))];
+  const userDocs = await Promise.all(
+    uniqueUserIds.map((userId) => db.collection("users").doc(userId).get())
+  );
+  const tokens = userDocs.flatMap((doc) => doc.data()?.fcmTokens || []);
+
+  if (tokens.length === 0) {
+    return { success: false, successCount: 0, failureCount: 0 };
+  }
+
+  const message = buildMessage({ tokens, title, body, data });
+  const response = await admin.messaging().sendEachForMulticast(message);
+  return {
+    success: response.successCount > 0,
+    successCount: response.successCount,
+    failureCount: response.failureCount,
+  };
+}
+
 async function removeInvalidFcmTokens(tokens) {
   const uniqueTokens = [...new Set(tokens.filter(Boolean))];
 
@@ -817,9 +1083,21 @@ app.post("/send-medicine-created-notification", async (req, res) => {
       });
     }
 
-    const tokens = patientDoc.data().fcmTokens || [];
+    const patientData = patientDoc.data() || {};
+    const caregiverId = String(patientData.linkedCaregiverId || "");
+    const caregiverDoc = caregiverId
+      ? await db.collection("users").doc(caregiverId).get()
+      : null;
+    const tokens = [
+      ...(patientData.fcmTokens || []),
+      ...(caregiverDoc?.data()?.fcmTokens || []),
+    ];
     const times = Array.isArray(medicineTimes) ? medicineTimes : [];
     const ids = Array.isArray(medicineIds) ? medicineIds : [];
+    const creationBatchId = String(
+      req.body?.creationBatchId ||
+        `${patientId}:${medicineDate}:${Date.now()}`
+    );
 
     if (!tokens.length) {
       return res.json({
@@ -838,12 +1116,14 @@ app.post("/send-medicine-created-notification", async (req, res) => {
         title,
         body,
         data: {
-        patientId,
-        medicineName: medicineName || "",
-        medicineDate: medicineDate || "",
-        medicineTimes: JSON.stringify(times),
-        medicineIds: JSON.stringify(ids),
-      },
+          eventKey: `medicine-created:${creationBatchId}`,
+          creationBatchId,
+          patientId,
+          medicineName: medicineName || "",
+          medicineDate: medicineDate || "",
+          medicineTimes: JSON.stringify(times),
+          medicineIds: JSON.stringify(ids),
+        },
       })
     );
 
@@ -985,9 +1265,11 @@ async function claimReminderDelivery({
     const delivery = snapshot.exists ? snapshot.data() || {} : {};
     const leaseUntil = delivery.reminderLeaseUntil?.toMillis?.() || 0;
 
+    const sourceData = medicineSnapshot.data() || {};
     if (
       !medicineSnapshot.exists ||
-      medicineSnapshot.data()?.isDone === true
+      sourceData.isDone === true ||
+      ["completed", "exception_pending"].includes(sourceData.status)
     ) {
       return { claimed: false, delivery, reason: "medicine_completed" };
     }
@@ -1063,6 +1345,7 @@ async function checkMedicineReminders() {
   const today = getTodayTaipeiDateText();
   const nowTime = getNowTaipeiTimeText();
   const now = new Date();
+  await checkDailyMedicineRefills(now);
   const snapshot = await db
     .collection("medicines")
     .where("isDone", "==", false)
@@ -1078,18 +1361,48 @@ async function checkMedicineReminders() {
     skippedCount: 0,
     failedCount: 0,
   };
+  const processedScheduleIds = new Set();
 
   for (const doc of snapshot.docs) {
     summary.checkedCount++;
     const data = doc.data() || {};
-    const medicineId = doc.id;
+    const scheduleId = String(data.scheduleId || "");
+    if (scheduleId && processedScheduleIds.has(scheduleId)) {
+      summary.skippedCount++;
+      continue;
+    }
+    if (scheduleId) processedScheduleIds.add(scheduleId);
+
+    const scheduleRef = scheduleId
+      ? db.collection("medicineSchedules").doc(scheduleId)
+      : null;
+    const scheduleDoc = scheduleRef ? await scheduleRef.get() : null;
+    const scheduleData = scheduleDoc?.data() || {};
+
+    if (
+      ["completed", "exception_pending"].includes(scheduleData.status)
+    ) {
+      summary.skippedCount++;
+      continue;
+    }
+
+    const medicineId = scheduleId || doc.id;
     const patientId = data.patientId || "";
-    const caregiverId = data.caregiverId || "";
-    const medicineName = data.name || "藥物";
-    const medicineTime = data.time || "";
-    const doseIndex = data.doseIndex || 1;
-    const totalDoses = parseInt(data.times || "1", 10) || 1;
-    const scheduledAt = buildScheduledDate(data.date, medicineTime);
+    const caregiverId =
+      scheduleData.caregiverId || data.caregiverId || "";
+    const medicineName =
+      (scheduleData.medicineItems || [])
+        .map((item) => item?.name)
+        .filter(Boolean)
+        .join("、") ||
+      data.name ||
+      "藥物";
+    const medicineTime = scheduleData.time || data.time || "";
+    const doseIndex = scheduleData.slotIndex || data.doseIndex || 1;
+    const totalDoses = 1;
+    const scheduledAt =
+      scheduleData.scheduledAt?.toDate?.() ||
+      buildScheduledDate(data.date, medicineTime);
     const cycle = getReminderCycle({
       scheduledAt,
       now,
@@ -1117,7 +1430,7 @@ async function checkMedicineReminders() {
         reminderKey,
         medicineId,
         patientId,
-        medicineRef: doc.ref,
+      medicineRef: scheduleRef || doc.ref,
         cycle,
       });
 
@@ -1127,6 +1440,15 @@ async function checkMedicineReminders() {
       }
 
       summary.claimedCount++;
+      if (scheduleRef && scheduleData.status === "scheduled") {
+        await scheduleRef.set(
+          {
+            status: "reminding",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
       if (Number(claim.delivery.reminderAttemptCount || 0) > 1) {
         summary.retryCount++;
       }
@@ -1222,6 +1544,84 @@ async function checkMedicineReminders() {
   }
 
   return summary;
+}
+
+async function checkDailyMedicineRefills(now = new Date()) {
+  const taipeiTime = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Taipei",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(now);
+  const [hour, minute] = taipeiTime.split(":").map(Number);
+
+  if (hour !== 8 || minute > 4) return;
+
+  const dateText = taipeiDateText(now);
+  const claimRef = db
+    .collection("systemJobs")
+    .doc(`medicine-refill-${dateText.replace(/\//g, "")}`);
+  const claimed = await db.runTransaction(async (transaction) => {
+    const claim = await transaction.get(claimRef);
+    if (claim.exists) return false;
+    transaction.create(claimRef, {
+      type: "medicine_refill_check",
+      date: dateText,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return true;
+  });
+
+  if (!claimed) return;
+
+  const schedulesSnapshot = await db
+    .collection("medicineSchedules")
+    .where("date", "==", dateText)
+    .get();
+  const schedulesByPatient = new Map();
+
+  for (const doc of schedulesSnapshot.docs) {
+    const schedule = { id: doc.id, ...doc.data() };
+    const list = schedulesByPatient.get(schedule.patientId) || [];
+    list.push(schedule);
+    schedulesByPatient.set(schedule.patientId, list);
+  }
+
+  for (const [patientId, schedules] of schedulesByPatient) {
+    const deviceSnapshot = await db
+      .collection("devices")
+      .where("patientId", "==", patientId)
+      .limit(1)
+      .get();
+    if (deviceSnapshot.empty) continue;
+
+    const slots = deviceSnapshot.docs[0].data()?.status?.slots || [];
+    const missingSlots = schedules
+      .filter((schedule) => {
+        const slot = slots.find(
+          (item) => normalizeSlotIndex(item) === schedule.slotIndex
+        );
+        return !slot || slot.hasMedicine !== true;
+      })
+      .map((schedule) => schedule.slotIndex)
+      .sort();
+
+    if (missingSlots.length === 0) continue;
+    const patientDoc = await db.collection("users").doc(patientId).get();
+    const caregiverId = patientDoc.data()?.linkedCaregiverId || "";
+    await sendMedicineEventNotification({
+      userIds: [caregiverId],
+      buildMessage: buildMedicineRefillMessage,
+      title: "今日藥物尚未補齊",
+      body: `${missingSlots.map((slot) => `第 ${slot} 格`).join("、")} 尚未放入今日藥包。`,
+      data: {
+        eventKey: `medicine-refill:${dateText}:${patientId}`,
+        patientId,
+        date: dateText,
+        slotIndexes: missingSlots.join(","),
+      },
+    });
+  }
 }
 
 app.post(
