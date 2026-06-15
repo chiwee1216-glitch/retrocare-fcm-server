@@ -31,6 +31,9 @@ const {
   classifyPackageRemoved,
   normalizeSlotIndex,
 } = require("./medicine_box_event");
+const {
+  shouldPersistDeviceReport,
+} = require("./device_report_throttle");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -43,6 +46,7 @@ const app = express();
 let reminderCheckRunning = false;
 let lastReminderCheckAt = 0;
 const REMINDER_CHECK_MIN_INTERVAL_MS = 15000;
+const deviceReportPersistedAt = new Map();
 
 app.use(cors());
 app.use(express.json());
@@ -210,6 +214,23 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
     const body = req.body || {};
     const slots = Array.isArray(body.status?.slots) ? body.status.slots : [];
     const reportedEvents = Array.isArray(body.events) ? body.events : [];
+    const nowMillis = Date.now();
+    const shouldPersist = shouldPersistDeviceReport({
+      lastPersistedAt: deviceReportPersistedAt.get(req.deviceId) || 0,
+      now: nowMillis,
+      eventCount: reportedEvents.length,
+    });
+
+    if (!shouldPersist) {
+      return res.json({
+        success: true,
+        throttled: true,
+        processedEventCount: 0,
+        completedMedicineIds: [],
+        exceptionIds: [],
+      });
+    }
+
     const reportResult = await db.runTransaction(async (transaction) => {
       const deviceDoc = await transaction.get(deviceRef);
 
@@ -277,6 +298,7 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
         message: "Register this device ID in the app first",
       });
     }
+    deviceReportPersistedAt.set(req.deviceId, nowMillis);
 
     const eventResult = await persistMedicineBoxEvents({
       deviceId: req.deviceId,
