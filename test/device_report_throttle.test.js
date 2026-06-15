@@ -5,22 +5,22 @@ const {
   shouldPersistDeviceReport,
 } = require("../device_report_throttle");
 
-test("throttles unchanged heartbeat reports inside fifteen seconds", () => {
+test("throttles unchanged heartbeat reports inside five minutes", () => {
   assert.equal(
     shouldPersistDeviceReport({
       lastPersistedAt: 1000,
-      now: 14999,
+      now: 300999,
       eventCount: 0,
     }),
     false
   );
 });
 
-test("persists a heartbeat after fifteen seconds", () => {
+test("persists a heartbeat after five minutes", () => {
   assert.equal(
     shouldPersistDeviceReport({
       lastPersistedAt: 1000,
-      now: 16000,
+      now: 301000,
       eventCount: 0,
     }),
     true

@@ -1,4 +1,4 @@
-const DEFAULT_HEARTBEAT_MS = 15000;
+const DEFAULT_HEARTBEAT_MS = 5 * 60 * 1000;
 
 function shouldPersistDeviceReport({
   lastPersistedAt = 0,
