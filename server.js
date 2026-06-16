@@ -47,6 +47,8 @@ let reminderCheckRunning = false;
 let lastReminderCheckAt = 0;
 const REMINDER_CHECK_MIN_INTERVAL_MS = 15000;
 const deviceReportPersistedAt = new Map();
+const DEVICE_CONFIG_CACHE_TTL_MS = 60 * 1000;
+const deviceConfigCache = new Map();
 
 app.use(cors());
 app.use(express.json());
@@ -76,6 +78,25 @@ function authenticateMedicineBox(req, res, next) {
 
   req.deviceId = deviceId;
   next();
+}
+
+async function getCachedDeviceConfig(deviceId) {
+  const cached = deviceConfigCache.get(deviceId);
+  const now = Date.now();
+  if (cached && now - cached.cachedAt < DEVICE_CONFIG_CACHE_TTL_MS) {
+    return cached.deviceDoc;
+  }
+
+  const deviceDoc = await db.collection("devices").doc(deviceId).get();
+  if (deviceDoc.exists) {
+    deviceConfigCache.set(deviceId, {
+      cachedAt: now,
+      deviceDoc,
+    });
+  } else {
+    deviceConfigCache.delete(deviceId);
+  }
+  return deviceDoc;
 }
 
 function authenticateCron(req, res, next) {
@@ -831,7 +852,7 @@ function buildScheduledDate(dateText, timeText) {
 
 app.get("/device/config", authenticateMedicineBox, async (req, res) => {
   try {
-    const deviceDoc = await db.collection("devices").doc(req.deviceId).get();
+    const deviceDoc = await getCachedDeviceConfig(req.deviceId);
 
     if (!deviceDoc.exists) {
       return res.status(404).json({
@@ -894,6 +915,7 @@ async function queueMedicineBoxCommand(patientId, action) {
     },
     { merge: true }
   );
+  deviceConfigCache.delete(deviceDoc.id);
 
   return { queued: true, deviceId: deviceDoc.id };
 }
@@ -1699,7 +1721,3 @@ app.listen(PORT, () => {
   console.log(`RetroCare FCM Server running on port ${PORT}`);
   triggerReminderCheck({ force: true });
 });
-
-setInterval(() => {
-  triggerReminderCheck();
-}, 30000);
