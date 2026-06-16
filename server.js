@@ -1391,8 +1391,9 @@ async function checkMedicineReminders() {
   const now = new Date();
   await checkDailyMedicineRefills(now);
   const snapshot = await db
-    .collection("medicines")
-    .where("isDone", "==", false)
+    .collection("medicineSchedules")
+    .where("date", "==", today)
+    .where("status", "in", ["scheduled", "reminding"])
     .get();
   const summary = {
     success: true,
@@ -1405,23 +1406,11 @@ async function checkMedicineReminders() {
     skippedCount: 0,
     failedCount: 0,
   };
-  const processedScheduleIds = new Set();
 
   for (const doc of snapshot.docs) {
     summary.checkedCount++;
-    const data = doc.data() || {};
-    const scheduleId = String(data.scheduleId || "");
-    if (scheduleId && processedScheduleIds.has(scheduleId)) {
-      summary.skippedCount++;
-      continue;
-    }
-    if (scheduleId) processedScheduleIds.add(scheduleId);
-
-    const scheduleRef = scheduleId
-      ? db.collection("medicineSchedules").doc(scheduleId)
-      : null;
-    const scheduleDoc = scheduleRef ? await scheduleRef.get() : null;
-    const scheduleData = scheduleDoc?.data() || {};
+    const scheduleData = doc.data() || {};
+    const scheduleRef = doc.ref;
 
     if (
       ["completed", "exception_pending"].includes(scheduleData.status)
@@ -1430,31 +1419,29 @@ async function checkMedicineReminders() {
       continue;
     }
 
-    const medicineId = scheduleId || doc.id;
-    const patientId = data.patientId || "";
-    const caregiverId =
-      scheduleData.caregiverId || data.caregiverId || "";
+    const medicineId = doc.id;
+    const patientId = scheduleData.patientId || "";
+    const caregiverId = scheduleData.caregiverId || "";
     const medicineName =
       (scheduleData.medicineItems || [])
         .map((item) => item?.name)
         .filter(Boolean)
         .join("、") ||
-      data.name ||
       "藥物";
-    const medicineTime = scheduleData.time || data.time || "";
-    const doseIndex = scheduleData.slotIndex || data.doseIndex || 1;
+    const medicineTime = scheduleData.time || "";
+    const doseIndex = scheduleData.slotIndex || 1;
     const totalDoses = 1;
     const scheduledAt =
       scheduleData.scheduledAt?.toDate?.() ||
-      buildScheduledDate(data.date, medicineTime);
+      buildScheduledDate(scheduleData.date, medicineTime);
     const cycle = getReminderCycle({
       scheduledAt,
       now,
-      isDone: data.isDone === true,
+      isDone: false,
     });
     const reminderKey = buildReminderKey(
       medicineId,
-      data.date || "",
+      scheduleData.date || "",
       medicineTime
     );
 
@@ -1474,7 +1461,7 @@ async function checkMedicineReminders() {
         reminderKey,
         medicineId,
         patientId,
-      medicineRef: scheduleRef || doc.ref,
+        medicineRef: scheduleRef,
         cycle,
       });
 
@@ -1484,7 +1471,7 @@ async function checkMedicineReminders() {
       }
 
       summary.claimedCount++;
-      if (scheduleRef && scheduleData.status === "scheduled") {
+      if (scheduleData.status === "scheduled") {
         await scheduleRef.set(
           {
             status: "reminding",

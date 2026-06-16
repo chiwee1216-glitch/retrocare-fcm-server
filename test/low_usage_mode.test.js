@@ -34,8 +34,21 @@ test("queued medicine-box commands invalidate the config cache", () => {
 test("medicine box can still poll commands frequently for timely care actions", () => {
   assert.match(
     boxSource,
-    /CLOUD_CONFIG_INTERVAL\s*=\s*5000/
+    /CLOUD_CONFIG_INTERVAL\s*=\s*60000/
   );
+});
+
+test("reminder check scans schedule rows instead of every unfinished medicine", () => {
+  const start = serverSource.indexOf("async function checkMedicineReminders()");
+  const end = serverSource.indexOf("async function checkDailyMedicineRefills", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+
+  const section = serverSource.slice(start, end);
+  assert.match(section, /collection\("medicineSchedules"\)/);
+  assert.match(section, /where\("date",\s*"==",\s*today\)/);
+  assert.match(section, /where\("status",\s*"in",\s*\["scheduled",\s*"reminding"\]\)/);
+  assert.doesNotMatch(section, /collection\("medicines"\)\s*[\s\S]{0,120}\.where\("isDone",\s*"==",\s*false\)/);
 });
 
 test("medicine box still reports hardware events quickly", () => {
