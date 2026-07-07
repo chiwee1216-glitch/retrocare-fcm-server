@@ -37,3 +37,15 @@ test("persists hardware events immediately", () => {
     true
   );
 });
+
+test("persists command acknowledgements immediately", () => {
+  assert.equal(
+    shouldPersistDeviceReport({
+      lastPersistedAt: 1000,
+      now: 1200,
+      eventCount: 0,
+      hasCommandAck: true,
+    }),
+    true
+  );
+});

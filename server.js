@@ -235,11 +235,13 @@ app.post("/device/report", authenticateMedicineBox, async (req, res) => {
     const body = req.body || {};
     const slots = Array.isArray(body.status?.slots) ? body.status.slots : [];
     const reportedEvents = Array.isArray(body.events) ? body.events : [];
+    const reportedCommandId = String(body.lastCommandId || "").trim();
     const nowMillis = Date.now();
     const shouldPersist = shouldPersistDeviceReport({
       lastPersistedAt: deviceReportPersistedAt.get(req.deviceId) || 0,
       now: nowMillis,
       eventCount: reportedEvents.length,
+      hasCommandAck: reportedCommandId.length > 0,
     });
 
     if (!shouldPersist) {
