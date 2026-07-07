@@ -22,8 +22,8 @@ test("Render server does not run a local 30-second reminder scan loop", () => {
   );
 });
 
-test("device config reads are protected by a one-minute Firestore cache", () => {
-  assert.match(serverSource, /DEVICE_CONFIG_CACHE_TTL_MS\s*=\s*60\s*\*\s*1000/);
+test("device config reads use a short cache so app-written commands are timely", () => {
+  assert.match(serverSource, /DEVICE_CONFIG_CACHE_TTL_MS\s*=\s*5\s*\*\s*1000/);
   assert.match(serverSource, /getCachedDeviceConfig/);
 });
 
@@ -31,11 +31,20 @@ test("queued medicine-box commands invalidate the config cache", () => {
   assert.match(serverSource, /deviceConfigCache\.delete\(deviceDoc\.id\)/);
 });
 
+test("mobile medicine-box commands go through an authenticated cache-invalidating endpoint", () => {
+  assert.match(
+    serverSource,
+    /app\.post\(\s*"\/device\/command",\s*authenticateFirebaseUser/
+  );
+  assert.match(serverSource, /queueMedicineBoxCommand\(patientId,\s*action\)/);
+});
+
 test("medicine box can still poll commands frequently for timely care actions", () => {
   assert.match(
     boxSource,
-    /CLOUD_CONFIG_INTERVAL\s*=\s*60000/
+    /CLOUD_CONFIG_INTERVAL\s*=\s*10000/
   );
+  assert.doesNotMatch(boxSource, /WiFi\.config\(/);
 });
 
 test("reminder check scans schedule rows instead of every unfinished medicine", () => {

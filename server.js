@@ -47,7 +47,7 @@ let reminderCheckRunning = false;
 let lastReminderCheckAt = 0;
 const REMINDER_CHECK_MIN_INTERVAL_MS = 15000;
 const deviceReportPersistedAt = new Map();
-const DEVICE_CONFIG_CACHE_TTL_MS = 60 * 1000;
+const DEVICE_CONFIG_CACHE_TTL_MS = 5 * 1000;
 const deviceConfigCache = new Map();
 
 app.use(cors());
@@ -453,6 +453,49 @@ async function canAccessPatient(userId, patientId) {
     String(patientData.linkedCaregiverId || "") === userId
   );
 }
+
+app.post("/device/command", authenticateFirebaseUser, async (req, res) => {
+  try {
+    const patientId = String(req.body?.patientId || "").trim();
+    const action = String(req.body?.action || "").trim();
+    const allowedActions = new Set(["beep", "help", "check_led"]);
+
+    if (!patientId) {
+      return res.status(400).json({
+        success: false,
+        message: "patientId required",
+      });
+    }
+
+    if (!allowedActions.has(action)) {
+      return res.status(400).json({
+        success: false,
+        message: "invalid device action",
+      });
+    }
+
+    if (!(await canAccessPatient(req.firebaseUser.uid, patientId))) {
+      return res.status(403).json({
+        success: false,
+        message: "Not authorized for this patient",
+      });
+    }
+
+    const result = await queueMedicineBoxCommand(patientId, action);
+    const success = result.queued || result.reason === "buzzer_disabled";
+
+    return res.status(success ? 200 : 404).json({
+      success,
+      ...result,
+    });
+  } catch (error) {
+    console.error("device command error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
 
 app.post(
   "/medicine-schedules/sync",
