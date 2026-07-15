@@ -39,6 +39,14 @@ test("mobile medicine-box commands go through an authenticated cache-invalidatin
   assert.match(serverSource, /queueMedicineBoxCommand\(patientId,\s*action\)/);
 });
 
+test("mobile medicine-box settings go through an authenticated cache-invalidating endpoint", () => {
+  assert.match(
+    serverSource,
+    /app\.post\(\s*"\/device\/settings",\s*authenticateFirebaseUser/
+  );
+  assert.match(serverSource, /deviceConfigCache\.delete\(deviceId\)/);
+});
+
 test("medicine box can still poll commands frequently for timely care actions", () => {
   assert.match(
     boxSource,

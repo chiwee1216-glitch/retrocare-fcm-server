@@ -499,6 +499,77 @@ app.post("/device/command", authenticateFirebaseUser, async (req, res) => {
   }
 });
 
+app.post("/device/settings", authenticateFirebaseUser, async (req, res) => {
+  try {
+    const patientId = String(req.body?.patientId || "").trim();
+    const patientName = String(req.body?.patientName || "").trim();
+    const deviceId = String(req.body?.deviceId || "").trim().toUpperCase();
+    const previousDeviceId = String(req.body?.previousDeviceId || "")
+      .trim()
+      .toUpperCase();
+    const buzzerEnabled = req.body?.buzzerEnabled !== false;
+
+    if (!patientId || !deviceId) {
+      return res.status(400).json({
+        success: false,
+        message: "patientId and deviceId required",
+      });
+    }
+
+    if (!/^[A-Z0-9_-]{3,40}$/.test(deviceId)) {
+      return res.status(400).json({
+        success: false,
+        message: "invalid deviceId",
+      });
+    }
+
+    if (!(await canAccessPatient(req.firebaseUser.uid, patientId))) {
+      return res.status(403).json({
+        success: false,
+        message: "Not authorized for this patient",
+      });
+    }
+
+    const batch = db.batch();
+    if (previousDeviceId && previousDeviceId !== deviceId) {
+      const previousRef = db.collection("devices").doc(previousDeviceId);
+      const previousDoc = await previousRef.get();
+      if (previousDoc.exists) {
+        const previousData = previousDoc.data() || {};
+        if (String(previousData.patientId || "") === patientId) {
+          batch.delete(previousRef);
+          deviceConfigCache.delete(previousDeviceId);
+        }
+      }
+    }
+
+    batch.set(
+      db.collection("devices").doc(deviceId),
+      {
+        patientId,
+        patientName,
+        buzzerEnabled,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    await batch.commit();
+    deviceConfigCache.delete(deviceId);
+
+    return res.json({
+      success: true,
+      deviceId,
+      buzzerEnabled,
+    });
+  } catch (error) {
+    console.error("device settings error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
 app.post(
   "/medicine-schedules/sync",
   authenticateFirebaseUser,
